@@ -1,0 +1,73 @@
+experiment:
+  name: xtx_precision_benchmark
+  seed: 123456
+  repeats: 3                 
+  warmup_iters: 1           
+
+matrix:
+  M: 1500000                 # rows
+  N: 10000                   # columns
+  dtype_storage: fp32        # canonical storage type
+  layout: row_major          # X stored in RAM
+
+
+numa:
+  gpu_local_node: 1          # from nvidia-smi topo
+  remote_node: 0
+  split_ratio: 0.5           # 50% rows on each node
+
+chunking:
+  rows_per_chunk: 300000     # ~12GB per chunk (fp32)
+  pinned_buffers: 1          # 1 pinned staging buffer
+  pinned_buffer_gb: 12
+
+
+gpu:
+  device_id: 0
+  backend: cublas
+  use_streams: true
+  streams: 2
+
+modes:
+  - name: fp32
+    input_dtype: fp32
+    compute: fp32
+    accumulate: fp32
+    cublas_math_mode: DEFAULT
+
+  - name: tf32
+    input_dtype: fp32
+    compute: tf32
+    accumulate: fp32
+    cublas_math_mode: TF32
+
+  - name: bf16
+    input_dtype: bf16
+    compute: tensorcore
+    accumulate: fp32
+    cast_on_gpu: true
+
+  - name: fp16
+    input_dtype: fp16
+    compute: tensorcore
+    accumulate: fp32
+    cast_on_gpu: true
+
+xtx:
+  algorithm: syrk            # syrk or gemm
+  triangle: lower            # compute lower triangle only
+  alpha: 1.0
+  beta_first: 0.0
+  beta_rest: 1.0
+
+metrics:
+  time_gpu_only: true        # CUDA events only
+  include_h2d: true
+  compute_tflops: true
+  reference_mode: fp32       # for error comparison
+  error_norm: frobenius
+
+output:
+  results_csv: results.csv
+  log_level: info
+
