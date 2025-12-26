@@ -1,6 +1,6 @@
 #pragma once
 #include <yaml-cpp/yaml.h>
-#include "configs/xtx_config.h"
+#include "config/xtx_config.h"
 
 #include <cstdint>
 #include <string>
@@ -36,15 +36,15 @@ Config load_config_yaml(const std::string& path) {
     if (root["chunking"]) {
         auto c = root["chunking"];
         if (c["rows_per_chunk"])   cfg.rows_per_chunk   = static_cast<int64_t>(c["rows_per_chunk"]);
-        if (c["pinned_buffers"])   cfg.pinned_buffers   = c["pinned_buffers"];
-        if (c["pinned_buffer_gb"]) cfg.pinned_buffer_gb = c["pinned_buffer_gb"];
+        if (c["pinned_buffers"])   cfg.pinned_buffers   = c["pinned_buffers"].as<int>;
+        if (c["pinned_buffer_gb"]) cfg.pinned_buffer_gb = c["pinned_buffer_gb"].as<double>;
     }
 
     if (root["gpu"]) {
         auto g = root["gpu"];
-        if (g["device_id"])   cfg.device_id   = g["device_id"];
-        if (g["use_streams"]) cfg.use_streams = g["use_streams"];
-        if (g["streams"])     cfg.stream      = g["streams"];
+        if (g["device_id"])   cfg.device_id   = g["device_id"].as<int>();
+        if (g["use_streams"]) cfg.use_streams = g["use_streams"].as<bool>();
+        if (g["streams"])     cfg.stream      = g["streams"].as<int>();
     }
 
     if (root["xtx"]) {

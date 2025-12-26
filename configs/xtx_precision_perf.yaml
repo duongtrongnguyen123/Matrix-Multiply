@@ -5,26 +5,32 @@ experiment:
     warmup_iters: 1
 
 matrix:
-    row: 150000
-    col: 10000
+    M: 150000
+    N: 10000
     dtype_storage: fp32
     layout: row_major
-
-numa:
-    gpu_local_node: 1
-    remote_node: 0
-    split_ratio: 0.5
 
 chunking: 
     rows_per_chunk: 300000
     pinned_buffers: 1
     pinned_buffer_gb: 12
 
-gpu:
-    device_id: 0
-    backend: cublas
-    use_streams: true
-    streams: 2
+devices:
+    - device_id: 1
+      backend: cublas
+      usestreams: true
+      streams: 2
+
+      host_plan:
+        numa_mode: manual     # manual / auto
+        local_node: 1
+        remote_node: 0
+        split_ratio: 0.5
+
+        threads_per_node: 8
+        max_threads: 0
+        pin_threads: true
+        numa_aware: true
 
 modes:
     - name: fp32
@@ -32,28 +38,33 @@ modes:
       compute: fp32
       accumulate: fp32
       cublas_math_mode: DEFAULT
+      algorithm: syrk # / gemm
 
     - name: tf32
       input_dtype: fp32
       compute: tf32
       accumulate: fp32
       cublas_math_mode: TF32
-
+      algorithm: gemmEx
+    
     - name: bf16
       input_dtype: bf16
       compute: tensorcore
       accumulate: fp32
+      cublas_math_mode: TENSOR_OP
       cast_on_gpu: true
+      algorithm: gemmEx 
 
     - name: fp16
       input_dtype: fp16
       compute: tensorcore
       accumulate: fp32
+      cublas_math_mode: TENSOR_OP
       cast_on_gpu: true
+      algorithm: gemmEx 
 
 # gemm / syrk
 xtx:
-    algorithm: syrk # / gemm
     triangle: lower
     alpha: 1.0
     beta_first: 0.0

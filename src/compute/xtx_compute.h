@@ -3,10 +3,24 @@
 #include <cstdint>
 #include <string>
 #include <vector>
+#include <config/xtx_config.h>
 
-struct Config;
+struct ComputeParams {
+    int64_t N;
+    int64_t rows_per_chunk;
+    int device_id;
+    std::string input_dtype;
+    std::string compute;
+    std::string accumulate;
+    std::string cublas_math_mode;
+    std::string algorithm;
+    std::string triangle;
+    float alpha;
+    float beta_first;
+    float beta_rest;
+};
 
-struct ModeCfg;
+
 
 /*
  * Compute C = X^T X on GPU.
@@ -24,8 +38,7 @@ struct ModeCfg;
  * - Accumulates in FP32
  */
 void compute_xtx_gpu_mode(
-    const Config& cfg,
-    const ModeCfg& mode,
+    const ComputeParams& params,
     const float* X_local,
     std::int64_t rows_local,
     const float* X_remote,
@@ -51,9 +64,6 @@ void compute_xtx_gpu(
  *
  * Returns true on success.
  */
-bool save_npy_f32(
-    const std::string& path,
-    const float* data_rowmajor,
-    std::int64_t N
-);
+
+
 

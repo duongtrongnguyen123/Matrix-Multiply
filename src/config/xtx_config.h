@@ -3,48 +3,77 @@
 #include <string>
 #include <vector>
 
+struct MatrixCfg {
+    int64_t M;
+    int64_t N;
+    uint64_t seed;
+    std::string dtype_storage;
+    std::string layout;
+};
+
+struct BenchmarkCfg {
+    int repeats = 1;
+    int warmup_iters = 0;
+};
+
+struct ChunkingCfg {
+    int64_t rows_per_chunk;
+    int pinned_buffers;
+    double pinned_buffer_gb;
+};
+
+struct NodeFrac {
+    int node = -1;
+    double frac = 0.0;
+};
+
+struct HostMemoryCfg {
+    std::string numa_mode = "manual"; // "manual" | "auto" (auto thì tuỳ mày xử lý sau)
+    std::vectorNodeFrac> placement;  // must sum to 1
+
+    int threads_per_node = 8;
+    int max_threads = 0;              // 0 = no cap
+    bool pin_threads = true;
+    bool numa_aware = true;
+};
+
+struct DeviceCfg {
+    int device_id;
+    std::string backend;   // "cublas"
+    bool use_streams;
+    int streams;
+
+};
+
 struct ModeCfg {
     std::string name;
     std::string input_dtype;
+    std::string algorithm = "syrk";
+    std::string compute;
     std::string cublas_math_mode;
     std::string accumulate;
     bool cast_on_gpu = true;
 };
 
-struct Config {
-    std::string name;
-    uint64_t seed = 1234;
-    int repeats = 1;
-    int warmup_iters = 0;
-
-    int64_t M = 1500000;
-    int64_t N = 10000;
-    std::string layout = "row_major";
-
-    int gpu_local_node = 1;
-    int remote_node = 0;
-    double split_ratio = 0.5;
-
-    // chunking (compute-only)
-    std::int64_t rows_per_chunk = 300000;
-    int pinned_buffers = 1;
-    double pinned_buffer_gb = 12.0;
-
-    // gpu (compute-only)
-    int device_id = 0;
-    bool use_streams = true;
-    int streams = 2;
-
-    std::string algorithm = "syrk"; // syrk/gemm
-    std::string triangle = "lower";
+struct ComputeScalars {
     float alpha = 1.0f;
     float beta_first = 0.0f;
-    float beta_rest = 1.0f;
+    float beta_rest  = 1.0f;
+};
 
-    // modes (compute-only)
-    std::vector<ModeCfg> modes;    
+struct Config {
+    std::string name;
 
+    MatrixCfg matrix;
+    ChunkingCfg chunking;
+    BenchmarkCfg benchmark;
+
+    HostMemoryCfg host_memory;    //numa nodes
+    std::vector<DeviceCfg> devices;
+    std::vector<ModeCfg> modes; // compute-only
+    ComputeScalars compute_scalars; 
 };
 
 Config load_config_yaml(const std::string& path);
+
 
