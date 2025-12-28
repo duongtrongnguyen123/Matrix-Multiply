@@ -6,6 +6,13 @@
 #include <iostream>
 #include <stdexcept>
 #include <string>
+#include <numa.h>
+#include <pthread.h>
+#include <sched.h>
+#include <thread>
+#include <exception>
+#include <algorithm>
+#include <cstddef>
 
 #include <cmath>
 
@@ -13,7 +20,8 @@
     #include <omp.h>
 #endif
 
-#include <generate/xtx_generate.h>
+#include <config/xtx_config.h>
+#include "generate/xtx_generate.h"
 
 // hash function
 static inline uint64_t splitmix64(uint64_t x) {
@@ -52,6 +60,22 @@ static void* numa_alloc_or_throw(size_t bytes, int node) {
     return p;
 }
 
+
+static std::vector<int64_t> split_rows_by_frac(int64_t M, const std::vector<NodeFrac>& placement) {
+    std::vector<int64_t> rows(placement.size(), 0);
+
+    int64_t used = 0;
+    for (size_t i = 0 ; i < rows.size() - 1 ; i ++ ) {
+        double frac = placement[i].frac;
+        int64_t row = static_cast<int64_t>(std::floor(frac * M));
+        rows[i] = row;
+        used += row;
+    }
+
+    rows.back() = M - used;
+    return rows;
+}
+
 static void pin_thread_to_numa_node(int node) {
     cpu_set_t cpuset;
     CPU_ZERO(&cpuset);
@@ -74,7 +98,166 @@ static void pin_thread_to_numa_node(int node) {
     if (rc != 0) throw std::runtime_error("pthread_setaffinity_np failed");
 }
 
+static void fill_rows_f32(float* base, int64_t rows, int64_t N, uint64_t seed,
+                          int64_t global_row_start,
+                          int threads, bool pin_threads, int node)
+{
+    auto worker = [&](int tid) {
+        if (pin_threads) {
+            pin_thread_to_numa_node(node); 
+        }
+        // block partition rows
+        int64_t r0 = (rows * tid) / threads;
+        int64_t r1 = (rows * (tid + 1)) / threads;
 
+        for (int64_t r = r0; r < r1; ++r) {
+            int64_t gr = global_row_start + r;
+            float* rowp = base + r * N;
+
+            for (int64_t c = 0; c < N; ++c) {
+                uint64_t idx = static_cast<uint64_t> (gr) * static_cast<uint64_t> (N) + static_cast<uint64_t> (c);
+                rowp[c] = make_randn_float(seed, idx); 
+            }
+        }
+    };
+
+    if (threads <= 1) { worker(0); return; }
+
+    std::vector<std::thread> ts;
+    ts.reserve(threads);
+    for (int t = 0; t < threads; ++t) ts.emplace_back(worker, t);
+    for (auto& th : ts) th.join();
+}
+
+
+
+GeneratedMatrix generate_random_matrix_multi_numa(
+        const GenerateParams& params
+) {
+    GeneratedMatrix out;
+    out.M = params.M;
+    out.N = params.N;
+
+    const int64_t M = params.M;
+    const int64_t N = params.N;
+    
+    if (!params.numa_aware || params.placement.empty()) {
+        // fallback: single node 0
+        NodeFrac nf{0, 1.0};
+        std::vector<NodeFrac> placement{nf};
+        auto rows = split_rows_by_frac(M, placement);
+
+        NodeBuffer b;
+        b.node = 0;
+        b.row_start = 0;
+        b.rows = M;
+        size_t bytes = (size_t)M * (size_t)N * sizeof(float);
+        b.bytes = bytes;
+        b.ptr = static_cast<float*> (numa_alloc_or_throw(bytes, b.node));
+
+        int threads = (params.max_threads > 0) ? std::min(params.max_threads, params.threads_per_node)
+                                               : params.threads_per_node;
+        threads = std::max(1, threads);
+
+        fill_rows_f32(b.ptr, b.rows, N, params.seed, b.row_start, threads, params.pin_threads, b.node);
+
+        out.bufs.push_back(b);
+        return out;
+    }
+
+    auto rows_per = split_rows_by_frac(M, params.placement);
+
+    int64_t row_cursor = 0;
+    out.bufs.reserve(rows_per.size());
+
+    for (size_t i = 0 ; i < rows_per.size() ; i ++ ) {
+        NodeBuffer b;
+
+        int node = params.placement[i].node;
+        int64_t row = rows_per[i];
+        b.row_start = row_cursor;
+        b.rows = row;
+        b.node = node;
+
+        size_t bytes = static_cast<size_t> (row) * static_cast<size_t> (N) * sizeof(float);
+        b.bytes = bytes;
+
+        b.ptr = static_cast<float*> (numa_alloc_or_throw(bytes, b.node));
+        
+        out.bufs.push_back(b);
+
+        row_cursor += row;
+    }
+
+    std::vector<std::thread> node_threads;
+    node_threads.reserve(out.bufs.size());
+
+    for (auto& b : out.bufs) {
+        node_threads.emplace_back([&, node=b.node, ptr=b.ptr, rows=b.rows, row_start=b.row_start] {
+            int threads = params.threads_per_node;
+            if (params.max_threads > 0) threads = std::min(threads, params.max_threads);
+            threads = std::max(1, threads);
+
+            fill_rows_f32(ptr, rows, N, params.seed, row_start, threads, params.pin_threads, node);
+        });
+    }
+
+    for (auto& th : node_threads) th.join();
+    return out;
+}
+
+
+
+
+
+
+
+/*
+void generate_random_matrix_2_numa(
+        const GenerateParams& params,
+        float** X_local, int64_t* rows_local,
+        float** X_remote, int64_t* rows_remote
+        ) {
+    if (numa_available() < 0) {
+        throw std::runtime_error("numa not support on this device numa_available() < 0");
+    }
+
+    const int max_node = numa_max_node();
+    if (params.gpu_local_node < 0 || params.gpu_local_node > max_node 
+        || params.remote_node < 0 || params.remote_node > max_node) {
+        throw std::runtime_error("invalid local_node or remote_node");
+    }
+
+    int64_t m_local = static_cast<int64_t>(params.M) * params.split_ratio;
+    int64_t m_remote = params.M - m_local;
+
+    const size_t bytes_local = static_cast<size_t> (m_local) * params.N * sizeof(float);
+    const size_t bytes_remote = static_cast<size_t>(m_remote) * params.N * sizeof(float);
+
+    std::cout << "gen M: " << params.M << "N: " << params.N << std::endl;
+    std::cout << "split_ratio: " << params.split_ratio << " ||| local_rows: " << m_local << " ||| remote_rows: " << m_remote << std::endl;
+    std::cout << "gen bytes_local=" << (bytes_local / (1024.0*1024.0*1024.0)) << " GiB"
+              << " bytes_remote=" << (bytes_remote / (1024.0*1024.0*1024.0)) << " GiB\n";
+
+    float *xl = static_cast<float*>(numa_alloc_or_throw(bytes_local, params.gpu_local_node));
+    float *xr = static_cast<float*>(numa_alloc_or_throw(bytes_remote, params.remote_node));
+
+    fill_matrix_row_major(xl, m_local, params.N, params.seed, 0);
+    fill_matrix_row_major(xr, m_remote, params.N, params.seed, static_cast<uint64_t>(m_local));
+
+    *X_local = xl;
+    *X_remote = xr;
+    *rows_local = m_local;
+    *rows_remote = m_remote;
+    
+    std::cout << "done" << std::endl;
+}
+
+
+
+
+
+/*
 // Touch pages so physical memory is really placed on that node (first-touch).
 static void first_touch_zero(void* p, size_t bytes) {
     constexpr size_t page = 4096;
@@ -84,7 +267,7 @@ static void first_touch_zero(void* p, size_t bytes) {
 }
 
 // Alloc two buffers in parallel (local/remote)
-void alloc_2_numa_parallel(
+void alloc_multi_numa_parallel(
     size_t bytes_local, int node_local, void** out_local,
     size_t bytes_remote, int node_remote, void** out_remote,
     bool do_first_touch = true
@@ -135,56 +318,4 @@ static void fill_matrix_row_major(float* X, int64_t rows, int64_t cols, uint64_t
     }
 }
 
-void generate_random_matrix_2_numa(
-        const GenerateParams& params,
-        float** X_local, int64_t* rows_local,
-        float** X_remote, int64_t* rows_remote
-        ) {
-    if (numa_available() < 0) {
-        throw std::runtime_error("numa not support on this device numa_available() < 0");
-    }
-
-    const int max_node = numa_max_node();
-    if (params.gpu_local_node < 0 || params.gpu_local_node > max_node 
-        || parmas.remote_mode < 0 || params.remote_node > max_node) {
-        throw std::runtime_error("invalid local_node or remote_node");
-    }
-
-    int64_t m_local = static_cast<int64_t>(params.M) * params.split_ratio;
-    int64_t m_remote = params.M - m_local;
-
-    const size_t bytes_local = static_cast<size_t> (m_local) * params.N * sizeof(float);
-    const size_t bytes_remote = static_cast<size_t>(m_remote) * params.N * sizeof(float);
-
-    std::cout << "gen M: " << params.M << "N: " << params.N << endl;
-    std::cout << "split_ratio: " << params.split_ratio << " ||| local_rows: " << m_local << " ||| remote_rows: " << m_remote << endl;
-    std::cout << "gen bytes_local=" << (bytes_local / (1024.0*1024.0*1024.0)) << " GiB"
-              << " bytes_remote=" << (bytes_remote / (1024.0*1024.0*1024.0)) << " GiB\n";
-
-    float *xl = static_cast<float*>(numa_alloc_or_throw(bytes_local, params.gpu_local_node));
-    float *xr = static_cast<float*>(numa_alloc_or_throw(bytes_remote, params.remote_node));
-
-    fill_matrix_row_major(xl, m_local, params.N, params.seed, 0);
-    fill_matrix_row_major(xr, m_remote, params.N, params.seed, static_cast<uint64_t>(m_local));
-
-    *X_local = xl;
-    *X_remote = xr;
-    *rows_local = m_local;
-    *rows_remote = m_remote;
-    
-    std::cout << "done" << std::endl;
-}
-
-void free_2_numa(float* X_local, size_t bytes_local, float* X_remote, size_t bytes_remote) {
-    if (X_local) {
-        numa_free(X_local, bytes_local);
-    }
-    if (X_remote) {
-        numa_free(X_remote, bytes_remote);
-    }
-}
-
-
-
-
-
+*/

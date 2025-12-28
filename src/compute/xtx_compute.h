@@ -4,22 +4,24 @@
 #include <string>
 #include <vector>
 #include <config/xtx_config.h>
+#include <generate/xtx_generate.h>
+
 
 struct ComputeParams {
     int64_t N;
     int64_t rows_per_chunk;
-    int device_id;
+    std::vector<DeviceCfg> devices;
     std::string input_dtype;
-    std::string compute;
-    std::string accumulate;
-    std::string cublas_math_mode;
     std::string algorithm;
     std::string triangle;
+    std::string compute;
+    std::string cublas_math_mode;
+    std::string accumulate;
+    
     float alpha;
     float beta_first;
     float beta_rest;
 };
-
 
 
 /*
@@ -37,13 +39,11 @@ struct ComputeParams {
  * - Supports SYRK (half compute) or GEMM
  * - Accumulates in FP32
  */
-void compute_xtx_gpu_mode(
-    const ComputeParams& params,
-    const float* X_local,
-    std::int64_t rows_local,
-    const float* X_remote,
-    std::int64_t rows_remote,
-    float* C_out_rowmajor
+static void compute_xtx_gpu_mode(
+    const ComputeParams& params, int device_id,
+    const float *X_local, std::int64_t rows_local,
+    const float *X_remote, std::int64_t rows_remote,
+    float *C_out_row_major, bool copy_back
 );
 
 /*
@@ -59,11 +59,12 @@ void compute_xtx_gpu(
     float* C_out_rowmajor
 );
 
-/*
- * Save a row-major float32 matrix (N x N) as NumPy .npy
- *
- * Returns true on success.
- */
+void compute_xtx_multi_gpu(
+    const ComputeParams& params,
+    const GeneratedMatrix& X,
+    float* C_out_row_major
+);
+
 
 
 

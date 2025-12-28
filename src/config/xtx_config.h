@@ -29,7 +29,7 @@ struct NodeFrac {
 
 struct HostMemoryCfg {
     std::string numa_mode = "manual"; // "manual" | "auto" (auto thì tuỳ mày xử lý sau)
-    std::vectorNodeFrac> placement;  // must sum to 1
+    std::vector<NodeFrac> placement;  // must sum to 1
 
     int threads_per_node = 8;
     int max_threads = 0;              // 0 = no cap
@@ -42,13 +42,13 @@ struct DeviceCfg {
     std::string backend;   // "cublas"
     bool use_streams;
     int streams;
-
 };
 
 struct ModeCfg {
     std::string name;
     std::string input_dtype;
     std::string algorithm = "syrk";
+    std::string triangle;
     std::string compute;
     std::string cublas_math_mode;
     std::string accumulate;
@@ -75,5 +75,6 @@ struct Config {
 };
 
 Config load_config_yaml(const std::string& path);
+
 
 

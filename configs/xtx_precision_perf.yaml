@@ -5,7 +5,7 @@ experiment:
     warmup_iters: 1
 
 matrix:
-    M: 150000
+    M: 1500000
     N: 10000
     dtype_storage: fp32
     layout: row_major
@@ -15,22 +15,22 @@ chunking:
     pinned_buffers: 1
     pinned_buffer_gb: 12
 
+host_memory:
+  numa_mode: manual          # manual / auto (auto = detect nodes, default spread)
+  placement:
+    - { node: 0, frac: 0.5 }
+    - { node: 1, frac: 0.5 }
+  threads_per_node: 8
+  max_threads: 0
+  pin_threads: true
+  numa_aware: true
+
 devices:
     - device_id: 1
       backend: cublas
       usestreams: true
       streams: 2
 
-      host_plan:
-        numa_mode: manual     # manual / auto
-        local_node: 1
-        remote_node: 0
-        split_ratio: 0.5
-
-        threads_per_node: 8
-        max_threads: 0
-        pin_threads: true
-        numa_aware: true
 
 modes:
     - name: fp32
@@ -80,3 +80,4 @@ metrics:
 output: 
     result_csv: result.csv
     log_level: info
+

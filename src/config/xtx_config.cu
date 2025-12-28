@@ -3,6 +3,12 @@
 
 #include <cstdint>
 #include <string>
+#include <iostream>
+
+static inline std::string to_lower(std::string s) {
+    for (char& c : s) c = (char)std::tolower((unsigned char)c);
+    return s;
+}
 
 Config load_config_yaml(const std::string& path) { 
     YAML::Node root = YAML::LoadFile(path);
@@ -19,7 +25,7 @@ Config load_config_yaml(const std::string& path) {
 
     if (root["experiment"]) {
         auto e = root["experiment"];
-        //if (e["name"]) cfg.name = e["name"].as<std::string>();
+        if (e["name"]) cfg.name = e["name"].as<std::string>();
         if (e["seed"]) matrix.seed = e["seed"].as<uint64_t>();
         if (e["repeats"])      benchmark.repeats      = e["repeats"].as<int>();
         if (e["warmup_iters"]) benchmark.warmup_iters = e["warmup_iters"].as<int>();
@@ -43,7 +49,7 @@ Config load_config_yaml(const std::string& path) {
     if (root["host_memory"]) {
         auto hm = root["host_memory"];
 
-        if (hm["numa_mode"]) host_memory.numa_mode = to_lower(hm["numa_mode"].as<std::string>());
+        if (hm["numa_mode"]) host_memory.numa_mode = hm["numa_mode"].as<std::string>();
 
         if (hm["threads_per_node"]) host_memory.threads_per_node = hm["threads_per_node"].as<int>();
         if (hm["max_threads"])      host_memory.max_threads      = hm["max_threads"].as<int>();
@@ -62,19 +68,16 @@ Config load_config_yaml(const std::string& path) {
                 nf.node = it["node"].as<int>();
                 nf.frac = it["frac"].as<double>();
 
-                require_cfg(nf.node >= 0, "host_memory.placement[" + std::to_string(i) + "].node must be >= 0");
-                require_cfg(nf.frac > 0.0, "host_memory.placement[" + std::to_string(i) + "].frac must be > 0");
-
                 host_memory.placement.push_back(nf);
             }
 
-            // validate sum(frac) ~= 1
             double sum = 0.0;
             for (const auto& nf : host_memory.placement) sum += nf.frac;
 
             const double eps = 1e-6;
-            require_cfg(std::fabs(sum - 1.0) <= eps,
-                        "`host_memory.placement` fractions must sum to 1 (got " + std::to_string(sum) + ")");
+            if (std::fabs(sum - 1.0) > eps) {
+                throw std::runtime_error("Invalid placement!!!");
+            }
         }
     }
     
@@ -91,7 +94,6 @@ Config load_config_yaml(const std::string& path) {
             if (d["use_streams"]) dev.use_streams = d["use_streams"].as<bool>();
             if (d["streams"])     dev.streams = d["streams"].as<int>();
 
-
             devices.push_back(dev);
         }
     }
@@ -106,18 +108,22 @@ Config load_config_yaml(const std::string& path) {
         mode.cublas_math_mode = m["cublas_math_mode"].as<std::string>();
         mode.algorithm        = m["algorithm"].as<std::string>();
         //mode.cast_on_gpu      = m["cast_on_gpu"].as<std::bool>();
-        cfg.modes.push_back(std::move(mode));
+        modes.push_back(std::move(mode));
     }
+    
     
     if (root["xtx"]) {
         auto x = root["xtx"];
-        benchmark.alpha      = x["alpha"].as<float>();
-        benchmark.beta_first = x["beta_first"].as<float>();
-        benchmark.beta_rest  = x["beta_rest"].as<float>();
-
+        for (auto& m: modes) {
+            m.triangle = x["triangle"].as<std::string>();
+        }
+        compute_scalars.alpha      = x["alpha"].as<float>();
+        compute_scalars.beta_first = x["beta_first"].as<float>();
+        compute_scalars.beta_rest  = x["beta_rest"].as<float>();
     }
+    
     if (matrix.M <= 0 || matrix.N <= 0) throw std::runtime_error("Invalid matrix size!");
-    if (matix.layout != "row_major") {
+    if (matrix.layout != "row_major") {
         throw std::runtime_error("Only support row-major");
     }
 
@@ -125,12 +131,11 @@ Config load_config_yaml(const std::string& path) {
     cfg.chunking = chunking;
     cfg.benchmark = benchmark;
 
+    cfg.host_memory = host_memory;
     cfg.devices = std::move(devices);
     cfg.modes = std::move(modes);
 
     cfg.compute_scalars = compute_scalars;
     return cfg;
 }
-
-
 
