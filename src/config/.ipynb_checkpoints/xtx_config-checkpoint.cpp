@@ -138,4 +138,3 @@ Config load_config_yaml(const std::string& path) {
     cfg.compute_scalars = compute_scalars;
     return cfg;
 }
-

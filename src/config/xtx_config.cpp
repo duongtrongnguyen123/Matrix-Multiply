@@ -1,59 +1,101 @@
-#pragma once
 #include <yaml-cpp/yaml.h>
 #include "config/xtx_config.h"
 
 #include <cstdint>
 #include <string>
+#include <iostream>
+
+static inline std::string to_lower(std::string s) {
+    for (char& c : s) c = (char)std::tolower((unsigned char)c);
+    return s;
+}
 
 Config load_config_yaml(const std::string& path) { 
     YAML::Node root = YAML::LoadFile(path);
     Config cfg;
+    
+    MatrixCfg matrix{};
+    ChunkingCfg chunking{};
+    BenchmarkCfg benchmark{};
+
+    HostMemoryCfg host_memory{};
+    std::vector<DeviceCfg> devices;
+    std::vector<ModeCfg> modes; // compute-only
+    ComputeScalars compute_scalars{}; 
 
     if (root["experiment"]) {
         auto e = root["experiment"];
         if (e["name"]) cfg.name = e["name"].as<std::string>();
-        if (e["seed"]) cfg.seed = e["seed"].as<uint64_t>();
-        if (e["repeats"])      cfg.repeats      = e["repeats"].as<int>();
-        if (e["warmup_iters"]) cfg.warmup_iters = e["warmup_iters"].as<int>();
+        if (e["seed"]) matrix.seed = e["seed"].as<uint64_t>();
+        if (e["repeats"])      benchmark.repeats      = e["repeats"].as<int>();
+        if (e["warmup_iters"]) benchmark.warmup_iters = e["warmup_iters"].as<int>();
     }
 
     if (root["matrix"]) {
         auto m = root["matrix"];
-        if (m["M"]) cfg.M = m["M"].as<int64_t>();
-        if (m["N"]) cfg.N = m["N"].as<int64_t>();
-        if (m["layout"]) cfg.layout = m["layout"].as<std::string>();
+        if (m["M"]) matrix.M = m["M"].as<int64_t>();
+        if (m["N"]) matrix.N = m["N"].as<int64_t>();
+        if (m["layout"]) matrix.layout = m["layout"].as<std::string>();
     }
     
-    if (root["numa"]) {
-        auto n = root["numa"];
-        if (n["gpu_local_node"]) cfg.gpu_local_node = n["gpu_local_node"].as<int>();
-        if (n["remote_node"])    cfg.remote_node    = n["remote_node"].as<int>();
-        if (n["split_ratio"])    cfg.split_ratio    = n["split_ratio"].as<double>();
-    } else {
-    // If remote_node not given, infer it as 1 - gpu_local_node later.
-    }
 
     if (root["chunking"]) {
         auto c = root["chunking"];
-        if (c["rows_per_chunk"])   cfg.rows_per_chunk   = static_cast<int64_t>(c["rows_per_chunk"]);
-        if (c["pinned_buffers"])   cfg.pinned_buffers   = c["pinned_buffers"].as<int>;
-        if (c["pinned_buffer_gb"]) cfg.pinned_buffer_gb = c["pinned_buffer_gb"].as<double>;
+        if (c["rows_per_chunk"])   chunking.rows_per_chunk   = (c["rows_per_chunk"]).as<int64_t>();
+        if (c["pinned_buffers"])   chunking.pinned_buffers   = c["pinned_buffers"].as<int>();
+        if (c["pinned_buffer_gb"]) chunking.pinned_buffer_gb = c["pinned_buffer_gb"].as<double>();
     }
 
-    if (root["gpu"]) {
-        auto g = root["gpu"];
-        if (g["device_id"])   cfg.device_id   = g["device_id"].as<int>();
-        if (g["use_streams"]) cfg.use_streams = g["use_streams"].as<bool>();
-        if (g["streams"])     cfg.stream      = g["streams"].as<int>();
-    }
+    if (root["host_memory"]) {
+        auto hm = root["host_memory"];
 
-    if (root["xtx"]) {
-        auto x = root["xtx"];
-        if (x["algorithm"])  cfg.algorithm  = x["algorithm"].as<std::string>();
-        if (x["triangle"])   cfg.triangle   = x["triangle"].as<std::string>();
-        if (x["alpha"])      cfg.alpha      = x["alpha"].as<float>();
-        if (x["beta_first"]) cfg.beta_first = x["beta_first"].as<float>();
-        if (x["beta_rest"])  cfg.beta_rest  = x["beta_rest"].as<float>();
+        if (hm["numa_mode"]) host_memory.numa_mode = hm["numa_mode"].as<std::string>();
+
+        if (hm["threads_per_node"]) host_memory.threads_per_node = hm["threads_per_node"].as<int>();
+        if (hm["max_threads"])      host_memory.max_threads      = hm["max_threads"].as<int>();
+        if (hm["pin_threads"])      host_memory.pin_threads      = hm["pin_threads"].as<bool>();
+        if (hm["numa_aware"])       host_memory.numa_aware       = hm["numa_aware"].as<bool>();
+
+        if (hm["placement"]) {
+            auto pl = hm["placement"];
+
+            host_memory.placement.clear();
+            host_memory.placement.reserve(pl.size());
+
+            for (const auto& it:pl) {
+                NodeFrac nf;
+
+                nf.node = it["node"].as<int>();
+                nf.frac = it["frac"].as<double>();
+
+                host_memory.placement.push_back(nf);
+            }
+
+            double sum = 0.0;
+            for (const auto& nf : host_memory.placement) sum += nf.frac;
+
+            const double eps = 1e-6;
+            if (std::fabs(sum - 1.0) > eps) {
+                throw std::runtime_error("Invalid placement!!!");
+            }
+        }
+    }
+    
+
+    if (root["devices"]) {
+        auto dlist = root["devices"];
+
+        for (const auto& d:dlist) {
+            DeviceCfg dev{};
+
+            if (d["device_id"]) dev.device_id = d["device_id"].as<int>();
+            if (d["backend"])   dev.backend = to_lower(d["backend"].as<std::string>());
+
+            if (d["use_streams"]) dev.use_streams = d["use_streams"].as<bool>();
+            if (d["streams"])     dev.streams = d["streams"].as<int>();
+
+            devices.push_back(dev);
+        }
     }
 
     for (const auto& m: root["modes"]) {
@@ -61,21 +103,38 @@ Config load_config_yaml(const std::string& path) {
 
         mode.name             = m["name"].as<std::string>();
         mode.input_dtype      = m["input_dtype"].as<std::string>();
+        mode.compute          = m["compute"].as<std::string>();
         mode.accumulate       = m["accumulate"].as<std::string>();
         mode.cublas_math_mode = m["cublas_math_mode"].as<std::string>();
-        mode.cast_on_gpu      = m["cast_on_gpu"].as<std::string>();
-        cfg.modes.push_back(std::move(mode));
+        mode.algorithm        = m["algorithm"].as<std::string>();
+        //mode.cast_on_gpu      = m["cast_on_gpu"].as<std::bool>();
+        modes.push_back(std::move(mode));
     }
     
-    if (cfg.remote_node == cfg.gpu_local_node) {
-        cfg.remote_node = 1 - cfg.gpu_local_node;
+    
+    if (root["xtx"]) {
+        auto x = root["xtx"];
+        for (auto& m: modes) {
+            m.triangle = x["triangle"].as<std::string>();
+        }
+        compute_scalars.alpha      = x["alpha"].as<float>();
+        compute_scalars.beta_first = x["beta_first"].as<float>();
+        compute_scalars.beta_rest  = x["beta_rest"].as<float>();
     }
-
-    if (cfg.M <= 0 || cfg.N <= 0) throw std::runtime_error("Invalid matrix size!");
-    if (cfg.layout != "row_major") {
+    
+    if (matrix.M <= 0 || matrix.N <= 0) throw std::runtime_error("Invalid matrix size!");
+    if (matrix.layout != "row_major") {
         throw std::runtime_error("Only support row-major");
     }
+
+    cfg.matrix = matrix;
+    cfg.chunking = chunking;
+    cfg.benchmark = benchmark;
+
+    cfg.host_memory = host_memory;
+    cfg.devices = std::move(devices);
+    cfg.modes = std::move(modes);
+
+    cfg.compute_scalars = compute_scalars;
     return cfg;
 }
-
-
