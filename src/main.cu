@@ -26,7 +26,7 @@ static inline double now_sec() {
 
 
 
-static void print_config(const Config& cfg) {
+static void print_config(const Config& cfg, const ModeCfg& mode) {
     std::cout << "======Config======" << std::endl;
     std::cout  << "name         " << cfg.name << std::endl;
     std::cout  << "seed         " << cfg.matrix.seed << std::endl;
@@ -34,10 +34,11 @@ static void print_config(const Config& cfg) {
     std::cout  << "M            " << cfg.matrix.M << std::endl;
     std::cout  << "N            " << cfg.matrix.N << std::endl;
     std::cout  << "layout       " << cfg.matrix.layout << std::endl;
-    std::cout << "rows per chunk " << cfg.chunking.rows_per_chunk << std::endl;
+    std::cout  << "rows per chunk " << cfg.chunking.rows_per_chunk << std::endl;
     std::cout  << "modes size   " << cfg.modes.size() << std::endl;
 
-    std::cout  << "algorithm    " << cfg.modes[0].algorithm << std::endl;
+    std::cout  << "algorithm    " << mode.algorithm << std::endl;
+    std::cout  << "name         " << mode.name << std::endl;
     //std::cout  << "triangle     " << cfg.triangle << std::endl;
     std::cout  << "repeats      " << cfg.benchmark.repeats << std::endl;
     
@@ -61,12 +62,25 @@ int main(int argc, char** argv) {
     }
 
     std::string cfg_path = argv[1];
-    std::string out_path = (argc >= 3) ? argv[2] : "";
+    // std::string out_path = (argc >= 3) ? argv[2] : " ";
     try {
         Config cfg = load_config_yaml(cfg_path);
-        print_config(cfg);
-        ModeCfg mode = cfg.modes[0];
+        size_t mode_idx = 2;           // choose algorithm
+        ModeCfg mode = cfg.modes[mode_idx];
+        print_config(cfg, mode);
 
+
+        std::vector<double> FLOPSs(cfg.modes.size(), 0);
+        for (auto& FLOP:FLOPSs) {
+            FLOP = 2.0f
+            * (double)cfg.matrix.M
+            * (double)cfg.matrix.N
+            * (double)cfg.matrix.N;
+        }
+        FLOPSs[0] = 1.0f
+            * (double)cfg.matrix.M
+            * (double)cfg.matrix.N
+            * (double)(cfg.matrix.N + 1);
         GenerateParams gp{cfg.matrix.M, cfg.matrix.N, 
                         cfg.matrix.seed, 
                         cfg.host_memory.placement,
@@ -92,58 +106,112 @@ int main(int argc, char** argv) {
 
         
         std::vector<float> C(static_cast<size_t> (cfg.matrix.N) * cfg.matrix.N, 0.0f);
-
-        for (int w = 0 ; w < cfg.benchmark.warmup_iters ; w ++ ) {
+        
+        // ---- warmup ----
+        for (int w = 0; w < cfg.benchmark.warmup_iters; ++w) {
             std::fill(C.begin(), C.end(), 0.0f);
-            compute_xtx_multi_gpu(cp, 
-                            X,
-                            C.data()); 
+            (void)compute_xtx_multi_device(cp, X, C.data());
         }
 
-        std::vector<double> times;
-        times.reserve(std::max(1, cfg.benchmark.repeats));
-
-        for (int i = 0 ; i < std::max(1, cfg.benchmark.repeats) ; i ++ ) {
+        // ---- benchmark ----
+        const int R = std::max(1, cfg.benchmark.repeats);
+        
+        std::vector<double> times;      // wall-clock seconds
+        times.reserve(R);
+        
+        std::vector<double> gpu_times;  // summed GPU total seconds
+        gpu_times.reserve(R);
+        
+        std::vector<double> h2d_times, cast_times, gemm_times;
+        h2d_times.reserve(R);
+        cast_times.reserve(R);
+        gemm_times.reserve(R);
+        
+        for (int i = 0; i < R; ++i) {
             std::fill(C.begin(), C.end(), 0.0f);
-
+        
             const double t0 = now_sec();
-            compute_xtx_multi_gpu(cp, 
-                            X,
-                            C.data()); 
+        
+            // returns per-GPU stats
+            std::vector<GpuTimeTotal> gpu_stats =
+                compute_xtx_multi_device(cp, X, C.data());
+        
             const double t1 = now_sec();
-            const double dt = t1 - t0;
-            times.push_back(dt);
-
-            const double FLOPS = 2.0 *  static_cast<double> (cfg.matrix.N) * static_cast<double> (cfg.matrix.N) * static_cast<double> (cfg.matrix.M);
-            const double GFLOPS = FLOPS / 1e9;
-            const double GFLOPS_sec = GFLOPS / dt;
-
-       }
-       std::sort(times.begin(), times.end());
-       const double t_min = times.front();
-       const double t_med = times[times.size() / 2];
-       const double t_max = times.back();
-       double t_mean = 0.0;
-       for (double x : times) t_mean += x;
-       t_mean /= (double)times.size();
-
-       std::cout << "\n===== Summary =====\n";
-       std::cout << "repeats: " << times.size() << "\n";
-       std::cout << "min    : " << t_min * 1e3 << " ms\n";
-       std::cout << "median : " << t_med * 1e3 << " ms\n";
-       std::cout << "mean   : " << t_mean * 1e3 << " ms\n";
-       std::cout << "max    : " << t_max * 1e3 << " ms\n";
-    
-       {
-           const double FLOPS = 2.0 * static_cast<double> (cfg.matrix.M) * static_cast<double> (cfg.matrix.N) * static_cast<double> (cfg.matrix.N);
-           const double GFLOPS = FLOPS / 1e9;
-           std::cout << "approx GFLOP/s (min time): " << (GFLOPS / t_min) << "\n";
-           std::cout << "approx GFLOP/s (median)  : " << (GFLOPS / t_med) << "\n";
-       }
+            const double wall_dt = t1 - t0;   // seconds
+            times.push_back(wall_dt);
+        
+            // ---- SUM across GPUs (total GPU work) ----
+            double h2d_ms  = 0.0;
+            double cast_ms = 0.0;
+            double gemm_ms = 0.0;
+        
+            for (const auto& g : gpu_stats) {
+                h2d_ms  += g.h2d_ms;
+                cast_ms += g.cast_ms;
+                gemm_ms += g.gemm_ms;
+            }
+        
+            // convert ms -> seconds
+            const double h2d_s  = h2d_ms  * 1e-3;
+            const double cast_s = cast_ms * 1e-3;
+            const double gemm_s = gemm_ms * 1e-3;
+        
+            h2d_times.push_back(h2d_s);
+            cast_times.push_back(cast_s);
+            gemm_times.push_back(gemm_s);
+        
+            gpu_times.push_back(h2d_s + cast_s + gemm_s);
+        }
 
         
-       std::cout << "===================\n\n";
+        // ---- summary helpers ----
+        auto stats = [](std::vector<double> v) {
+            std::sort(v.begin(), v.end());
+            const double mn = v.front();
+            const double md = v[v.size() / 2];
+            const double mx = v.back();
+            double mean = 0.0;
+            for (double x : v) mean += x;
+            mean /= (double)v.size();
+            return std::tuple<double,double,double,double>(mn, md, mean, mx);
+        };
+        
+        auto [t_min, t_med, t_mean, t_max] = stats(times);
+        
+        auto [gpu_min, gpu_med, gpu_mean, gpu_max] = stats(gpu_times);
+        auto [h2d_min, h2d_med, h2d_mean, h2d_max] = stats(h2d_times);
+        auto [cast_min, cast_med, cast_mean, cast_max] = stats(cast_times);
+        auto [gemm_min, gemm_med, gemm_mean, gemm_max] = stats(gemm_times);
+        
+        const double FLOPS = FLOPSs[mode_idx];
+        const double GFLOPS = FLOPS / 1e9;
+        
+        // ---- print summary ----
+        std::cout << "\n===== Summary =====\n";
+        std::cout << "repeats: " << times.size() << "\n\n";
+        
+        std::cout << "[Wall-clock total]\n";
+        std::cout << "min    : " << t_min  * 1e3 << " ms\n";
+        std::cout << "median : " << t_med  * 1e3 << " ms\n";
+        std::cout << "mean   : " << t_mean * 1e3 << " ms\n";
+        std::cout << "max    : " << t_max  * 1e3 << " ms\n";
+        
+        std::cout << "[GPU total (h2d+cast+gemm)]\n";
+        std::cout << "min    : " << gpu_min  * 1e3 << " ms\n";
+        std::cout << "median : " << gpu_med  * 1e3 << " ms\n";
+        std::cout << "mean   : " << gpu_mean * 1e3 << " ms\n";
+        std::cout << "max    : " << gpu_max  * 1e3 << " ms\n";
+        std::cout << "approx GFLOP/s (min gpu time): " << (GFLOPS / gemm_min) << "\n";
+        std::cout << "approx GFLOP/s (median gpu)  : " << (GFLOPS / gemm_med) << "\n\n";
+        
+        std::cout << "[GPU breakdown]\n";
+        std::cout << "H2D   mean: " << h2d_mean  * 1e3 << " ms (median " << h2d_med  * 1e3 << ")\n";
+        std::cout << "CAST  mean: " << cast_mean * 1e3 << " ms (median " << cast_med * 1e3 << ")\n";
+        std::cout << "GEMM  mean: " << gemm_mean * 1e3 << " ms (median " << gemm_med * 1e3 << ")\n";
+        
+        std::cout << "===================\n\n";
 
+        /*
        // 6) Save result for further calculations
        if (!save_npy_fp32(out_path, C.data(), cfg.matrix.N)) {
            std::cerr << "[warn] failed to save npy to: " << out_path << "\n";
@@ -151,7 +219,7 @@ int main(int argc, char** argv) {
        else {
            std::cout << "Saved C to: " << out_path << "\n";
        }
-
+        */
 
         return 0;
     }

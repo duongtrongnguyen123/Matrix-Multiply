@@ -14,48 +14,17 @@
 
 
 #include <compute/xtx_compute.h>
-
-static inline void cuda_check(cudaError_t e, const char* msg) {
-    if (e != cudaSuccess) {
-        throw std::runtime_error(std::string("[cuda] ") + msg + ": " + cudaGetErrorString(e));
-    }
-}
-
-static inline void cublas_check(cublasStatus_t s, const char* msg) {
-    if (s != CUBLAS_STATUS_SUCCESS) {
-        throw std::runtime_error(std::string("[cublas] ") + msg + " (status=" + std::to_string((int)s) + ")");
-    }
-}
-
-static inline std::string lower(std::string x) {
-    for (char& c : x) c = (char)std::tolower((unsigned char)c);
-    return x;
-}
-
-static inline cublasMath_t parse_math_mode(std::string s) {
-    if (s.empty()) return CUBLAS_DEFAULT_MATH;
-    s = lower(s);
-
-    if (s == "default") return CUBLAS_DEFAULT_MATH;
-    if (s == "tf32") return CUBLAS_TF32_TENSOR_OP_MATH;
-    if (s == "pedantic") return CUBLAS_PEDANTIC_MATH;
-
-    if (s == "tensor_op" || s == "tensorop" || s == "tensor") return CUBLAS_DEFAULT_MATH;
-
-#if defined(CUBLAS_MATH_DISALLOW_REDUCED_PRECISION_REDUCTION)
-    if (s == "disallow_reduced_precision_reduction") {
-        return CUBLAS_MATH_DISALLOW_REDUCED_PRECISION_REDUCTION;
-    }
-#endif
-
-    return CUBLAS_DEFAULT_MATH;
-}
+#include <compute/utils.h>
+#include <compute/xtx_cublas.h>
+#include <compute/xtx_cublasLt.h>
 
 
-static inline cublasFillMode_t parse_triangle(const std::string& tri) {
-    if (tri == "upper") return CUBLAS_FILL_MODE_UPPER;
-    return CUBLAS_FILL_MODE_LOWER;
-}
+// ===== quick cublasLt XTX test knobs =====
+static constexpr bool USE_CUBLASLT_XTX = true;
+static constexpr bool CUBLASLT_ENABLE_TF32 = true;
+
+// 256 MB workspace is safe for most GEMM shapes
+static constexpr size_t CUBLASLT_WORKSPACE_BYTES = 256ull * 1024 * 1024;
 
 __global__ void mirror_triangle(float* C, int N, int upper_from_lower) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -71,99 +40,14 @@ __global__ void mirror_triangle(float* C, int N, int upper_from_lower) {
     }
 }
 
-static int read_int_file(const std::string& path) {
-    std::ifstream f(path);
-    if (!f) return -1;
-    int x = -1;
-    f >> x;
-    return x;
-}
 
-static int gpu_to_numa_node(int device_id) {
-    char pci[32];
-    cudaDeviceGetPCIBusId(pci, sizeof(pci), device_id);
-    // pci looks like "0000:65:00.0"
-
-    std::string path = std::string("/sys/bus/pci/devices/") + pci + "/numa_node";
-    int node = read_int_file(path);
-
-    if (node < 0) node = 0; // fallback
-    return node;
-}
-
-
-static void run_1_chunk_fp32_syrk(
-        cublasHandle_t h, cublasFillMode_t uplo,
-        int N, int K, 
-        const float* dX, float* dC,
-        float alpha, float beta
-        ) {
-    cublas_check(
-            cublasSsyrk(h, uplo, CUBLAS_OP_N,
-                        N, K,        // size of C, inner dimension
-                        &alpha,
-                        dX, N,       // pointer to X, leading dim A
-                        &beta, 
-                        dC, N),      // pointer to C, leading dim C
-            "cublasSsyrk"
-            );
-}
-
-static void run_1_chunk_fp32_gemm(
-        cublasHandle_t h,
-        int N, int K,
-        const float* dX,
-        float* dC,
-        float alpha, float beta
-        ) {
-    cublas_check(
-            cublasSgemm(h, CUBLAS_OP_N, CUBLAS_OP_T,
-                        N, N, K,
-                        &alpha, 
-                        dX, N,
-                        dX, N,
-                        &beta, 
-                        dC, N),
-            "cublasSgemm"
-            );
-}
-
-template <typename TO>
-__global__ void cast_f32_to(const float *in, TO *out, size_t n) {
-    uint64_t idx = static_cast<uint64_t> (blockIdx.x) * static_cast<uint64_t> (blockDim.x) + static_cast<uint64_t> (threadIdx.x);
-    if (idx < n) out[idx] = static_cast<TO> (in[idx]);
-}
-
-static void run_1_chunk_gemm_ex(
-        cublasHandle_t h, 
-        int N, int K,
-        const void *dX, cudaDataType Atype,  // X: k*n
-        float *dC,                            // output
-        float alpha, float beta,
-        cublasComputeType_t computeType
-        ) {
-    cublas_check(
-            cublasGemmEx(h, CUBLAS_OP_N, CUBLAS_OP_T,
-                          N, N, K,
-                          &alpha, 
-                          dX, Atype, N,
-                          dX, Atype, N,
-                          &beta,
-                          dC, CUDA_R_32F, N,
-                          computeType,
-                          CUBLAS_GEMM_DEFAULT_TENSOR_OP
-                          ),
-            "cublasSgemmEx"
-            );
-}
-
-static void compute_xtx_gpu_mode(
+static void compute_xtx_gpu_single_device(
         const ComputeParams& params, int device_id,
         const float *X_local, std::int64_t rows_local,
         const float *X_remote, std::int64_t rows_remote,
-        float *C_out_row_major, bool copy_back
+        float *C_out_row_major, bool copy_back,
+        GpuTimeTotal& time
         ) {
-    const int m_total = rows_local + rows_remote;
     const int N = static_cast<int> (params.N);
 
     if (!C_out_row_major) {
@@ -211,17 +95,37 @@ static void compute_xtx_gpu_mode(
     if (want_bf16) cuda_check(
                         cudaMalloc(reinterpret_cast<void**>(&dXf),                        max_chunk_elems * sizeof(__nv_bfloat16)),
                         "cudaMallocbf16");
-
+    
+    // timer to time H2D time, compute time, casting time
     const cublasFillMode_t uplo = parse_triangle(params.triangle);
+
+    int max_chunks = (rows_local + rows_per_chunk - 1) / rows_per_chunk +
+                     (rows_remote + rows_per_chunk - 1) / rows_per_chunk;
+
+    std::vector<cudaEvent_t> gemm_start(max_chunks, 0), gemm_stop(max_chunks, 0);
+    std::vector<cudaEvent_t> h2d_start(max_chunks, 0), h2d_stop(max_chunks, 0);
+    std::vector<cudaEvent_t> cast_start(max_chunks, 0), cast_stop(max_chunks, 0);
+
+    for (int i = 0; i < max_chunks; ++i) {
+        cudaEventCreate(&gemm_start[i]);
+        cudaEventCreate(&gemm_stop[i]);
+        cudaEventCreate(&h2d_start[i]);
+        cudaEventCreate(&h2d_stop[i]);
+        cudaEventCreate(&cast_start[i]);
+        cudaEventCreate(&cast_stop[i]);
+    }
+
+    int chunk_id = 0;
 
     // X points to DRAM, diff with dXf
     auto process_source = [&](const float* X, int64_t rows) {
         int64_t done = 0;
         while (done < rows) {
-            int64_t K = std::min<int64_t> (rows_per_chunk, rows-done);
+            int64_t K = std::min<int64_t> (rows_per_chunk, rows - done);
             const size_t elems = static_cast<size_t> (K) * static_cast<size_t> (N);
 
             // H2D copy
+            cudaEventRecord(h2d_start[chunk_id], stream);
             cuda_check(
                     cudaMemcpyAsync(dXf, X + static_cast<size_t> (done) * N, 
                                     elems * sizeof(float), 
@@ -229,53 +133,89 @@ static void compute_xtx_gpu_mode(
                                     ), 
                     "cudaMemcpuAsync dXf -> X"
             );
+            cudaEventRecord(h2d_stop[chunk_id], stream);     
+            // stop H2D timer
 
             const float alpha = params.alpha;
             const float beta  = (done == 0 && X == X_local) ? params.beta_first : params.beta_rest;
 
+            
             if (want_fp32) {
+                
                 if (params.algorithm == "syrk") {
                     run_1_chunk_fp32_syrk(handle, uplo,
                                           N, static_cast<int> (K), 
                                           dXf, dC,
                                           alpha, beta);
                 }
-                else run_1_chunk_fp32_gemm(handle, 
-                                           N, static_cast<int> (K),
-                                           dXf, dC,
-                                           alpha, beta); 
+                else {
+                    if (USE_CUBLASLT_XTX) {
+                        cudaEventRecord(gemm_start[chunk_id], stream);
+                        run_1_chunk_fp32_xtx_cublaslt(
+                            N, static_cast<int>(K),
+                            dXf, dC,
+                            alpha, beta,
+                            stream,
+                            /*workspace=*/nullptr,
+                            /*workspace_bytes=*/CUBLASLT_WORKSPACE_BYTES,
+                            /*enable_tf32=*/CUBLASLT_ENABLE_TF32
+                        );
+                        cudaEventRecord(gemm_stop[chunk_id], stream);
+                    } else {
+                        
+                        run_1_chunk_fp32_gemm(handle,
+                                              N, static_cast<int>(K),
+                                              dXf, dC,
+                                              alpha, beta);
+                    }
+                }
+                
             }
             else if (want_fp16) {
                 int thread = 256;
                 int blocks = static_cast<int>((elems + thread - 1) / thread);
+
+                cudaEventRecord(cast_start[chunk_id], stream);
                 cast_f32_to<<<blocks, thread, 0, stream>>>(dXf, dXh, elems);
                 cuda_check(cudaGetLastError(), "cast fp32 to fp16 kernel");
+                cudaEventRecord(cast_stop[chunk_id], stream);
+                
+                cudaEventRecord(gemm_start[chunk_id], stream);
                 run_1_chunk_gemm_ex(handle, 
                                     N, static_cast<int> (K),
                                     dXh, CUDA_R_16F, 
                                     dC, 
                                     alpha, beta, 
                                     CUBLAS_COMPUTE_32F);
+                cudaEventRecord(gemm_stop[chunk_id], stream);
             }
             else {
                 int thread = 256;
                 int blocks = static_cast<int>((elems + thread - 1) / thread);
+
+                cudaEventRecord(cast_start[chunk_id], stream);
                 cast_f32_to<<<blocks, thread, 0, stream>>>(dXf, dXb, elems);
                 cuda_check(cudaGetLastError(), "cast fp32 to bf16 kernel");
+                cudaEventRecord(cast_stop[chunk_id], stream);
+
+                cudaEventRecord(gemm_start[chunk_id], stream);
                 run_1_chunk_gemm_ex(handle,
                                     N, static_cast<int> (K),
                                     dXb, CUDA_R_16BF,
                                     dC, 
                                     alpha, beta,
                                     CUBLAS_COMPUTE_32F);
+                cudaEventRecord(gemm_stop[chunk_id], stream);
             }
             
             done += K;
-        }        
+            chunk_id++;
+        }
     };
 
     if (X_local && rows_local > 0)  process_source(X_local, rows_local);
     if (X_remote && rows_remote > 0) process_source(X_remote, rows_remote);
+
     
     if (want_fp32 && params.algorithm == "syrk") {
         dim3 block(16, 16);
@@ -290,7 +230,31 @@ static void compute_xtx_gpu_mode(
     if (copy_back) {
         cuda_check(cudaMemcpyAsync(C_out_row_major, dC, bytesC, cudaMemcpyDeviceToHost, stream), "cudaMemcopyAsync device 2 host");
     }        
-cuda_check(cudaStreamSynchronize(stream), "cudaStreamSynchronize");
+    cuda_check(cudaStreamSynchronize(stream), "cudaStreamSynchronize");
+
+
+    float gemm_ms_total = 0.0f;
+    float h2d_ms_total = 0.0f;
+    float cast_ms_total = 0.0f;
+    for (int i = 0; i < chunk_id; ++i) {
+        float gemm = 0.f;
+        cudaEventElapsedTime(&gemm, gemm_start[i], gemm_stop[i]);
+        gemm_ms_total += gemm;
+
+        float h2d = 0.f;
+        cudaEventElapsedTime(&h2d, h2d_start[i], h2d_stop[i]);
+        h2d_ms_total += h2d;
+
+        if (!want_fp32) {
+            float cast = 0.f;
+            cudaEventElapsedTime(&cast, cast_start[i], cast_stop[i]);
+            cast_ms_total += cast;
+        }
+    }
+    time.gemm_ms = gemm_ms_total;
+    time.h2d_ms  = h2d_ms_total;
+    time.cast_ms = cast_ms_total;
+
 
     if (dXb) cudaFree(dXb);
     if (dXh) cudaFree(dXh);
@@ -303,7 +267,7 @@ cuda_check(cudaStreamSynchronize(stream), "cudaStreamSynchronize");
 
 
 
-void compute_xtx_multi_gpu(
+std::vector<GpuTimeTotal> compute_xtx_multi_device(
     const ComputeParams& params,
     const GeneratedMatrix& X,
     float* C_out_row_major
@@ -324,33 +288,40 @@ void compute_xtx_multi_gpu(
         }
     }
 
-
-
+    // times
+    std::vector<GpuTimeTotal> times(used);
+    
     // only 1 gpu
     if (used == 1) {
-        const int dev_id = params.devices[0].device_id;
-        ComputeParams p = params;
-
-        const int gpu_node = gpu_to_numa_node(dev_id);
-
-        const NodeBuffer* local  = nullptr;
-        const NodeBuffer* remote = nullptr;
-
+        const int device_id = params.devices[0].device_id;   
+        const int gpu_node = gpu_to_numa_node(device_id);
+        const NodeBuffer* src0 = nullptr;  // primary source
+        const NodeBuffer* src1 = nullptr;  // optional second source
+        
+        // 1) Prefer a buffer that matches the GPU NUMA node
         for (const auto& b : X.bufs) {
-            if (b.node == gpu_node && !local) local = &b;
-            else if (!remote) remote = &b;
+            if (b.node == gpu_node) { src0 = &b; break; }
         }
-        if (!local)  local  = &X.bufs[0];
-        if (!remote) remote = nullptr;
-
-        compute_xtx_gpu_mode(
-            p, dev_id,
-            local->ptr,  local->rows,
-            remote ? remote->ptr : 0,
-            remote ? remote->rows : 0,
-            C_out_row_major,
-            true);
-        return;
+        
+        // 2) Fallback: if no "local-to-GPU" buffer exists, pick the first buffer
+        if (!src0) {
+            src0 = &X.bufs[0];
+        }
+        
+        // 3) Pick a second, distinct buffer (if any)
+        for (const auto& b : X.bufs) {
+            if (&b != src0) { src1 = &b; break; }
+        }
+        
+        
+        compute_xtx_gpu_single_device(
+            params, device_id,
+            src0->ptr, src0->rows,
+            src1 ? src1->ptr : nullptr,
+            src1 ? src1->rows : 0,
+            C_out_row_major, false,
+            times[0]);
+        return times;
     }
 
 
@@ -364,21 +335,18 @@ void compute_xtx_multi_gpu(
         used, std::vector<float>(C_elems, 0.0f)
     );
 
-
     std::vector<std::thread> gpu_threads;
     gpu_threads.reserve(used);
 
     // else launch exactly the GPUs specified in YAML
     for (int i = 0; i < used; ++i) {
-        const int dev_id = params.devices[i].device_id;
+        const int device_id = params.devices[i].device_id;
 
-        gpu_threads.emplace_back([&, i, dev_id] {
+        gpu_threads.emplace_back([&, i, device_id] {
             // per-thread params copy so we can set device_id without races
-            ComputeParams p = params;               // <-- important
-            // (optional) p.use_streams etc from params.devices[i] if you need
 
             // detect which NUMA node this GPU is closest to
-            const int gpu_node = gpu_to_numa_node(dev_id);
+            const int gpu_node = gpu_to_numa_node(device_id);
 
             // pick buffer that lives on that NUMA node
             const NodeBuffer* buf = nullptr;
@@ -388,13 +356,12 @@ void compute_xtx_multi_gpu(
             if (!buf) buf = &X.bufs[0]; // fallback
 
             // compute partial C on this GPU
-            compute_xtx_gpu_mode(
-                p, dev_id,
+            compute_xtx_gpu_single_device(
+                params, device_id,
                 buf->ptr, buf->rows,   // X_local
                 nullptr, 0,            // X_remote unused in multi-GPU
-                C_partial[i].data(),
-                true                   // copy_back=true for runnable correctness
-            );
+                C_partial[i].data(), false,
+                times[i]);
         });
     }
 
@@ -407,6 +374,7 @@ void compute_xtx_multi_gpu(
             C_out_row_major[k] += C_partial[i][k];
         }
     }
+    return times;
 }
 
 

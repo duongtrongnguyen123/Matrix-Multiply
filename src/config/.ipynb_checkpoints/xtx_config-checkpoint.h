@@ -19,7 +19,7 @@ struct BenchmarkCfg {
 struct ChunkingCfg {
     int64_t rows_per_chunk;
     int pinned_buffers;
-    double pinned_buffer_gb;
+    
 };
 
 struct NodeFrac {

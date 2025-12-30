@@ -1,18 +1,19 @@
 #include <numa.h>
-
+#include <numaif.h>
+#include <unistd.h>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
 #include <iostream>
 #include <stdexcept>
 #include <string>
-#include <numa.h>
 #include <pthread.h>
 #include <sched.h>
 #include <thread>
 #include <exception>
 #include <algorithm>
 #include <cstddef>
+
 
 #include <cmath>
 
@@ -58,6 +59,29 @@ static void* numa_alloc_or_throw(size_t bytes, int node) {
     }
 
     return p;
+}
+
+
+void print_numa_residency(void* ptr, size_t bytes) {
+    const int page = 4096;
+    int pages = bytes / page;
+
+    std::vector<void*> addrs;
+    std::vector<int> status(pages);
+
+    for (int i = 0; i < pages; i += 256) { // sample pages
+        addrs.push_back((char*)ptr + (size_t)i * page);
+    }
+
+    move_pages(0, addrs.size(), addrs.data(), nullptr, status.data(), 0);
+
+    int n0 = 0, n1 = 0;
+    for (int s : status) {
+        if (s == 0) n0++;
+        if (s == 1) n1++;
+    }
+
+    printf("NUMA residency: N0=%d  N1=%d\n", n0, n1);
 }
 
 
@@ -155,15 +179,27 @@ GeneratedMatrix generate_random_matrix_multi_numa(
         b.bytes = bytes;
         b.ptr = static_cast<float*> (numa_alloc_or_throw(bytes, b.node));
 
+
         int threads = (params.max_threads > 0) ? std::min(params.max_threads, params.threads_per_node)
                                                : params.threads_per_node;
         threads = std::max(1, threads);
 
         fill_rows_f32(b.ptr, b.rows, N, params.seed, b.row_start, threads, params.pin_threads, b.node);
 
+        cudaError_t st = cudaHostRegister(b.ptr, b.bytes, cudaHostRegisterDefault);
+        if (st == cudaSuccess) {
+            b.pinned = true;
+        } 
+        else {
+            b.pinned = false;
+            cudaGetLastError(); // clear sticky error if you want
+            std::cout << "false here" << std::endl;
+}
+
         out.bufs.push_back(b);
         return out;
     }
+
 
     auto rows_per = split_rows_by_frac(M, params.placement);
 
@@ -193,12 +229,21 @@ GeneratedMatrix generate_random_matrix_multi_numa(
     node_threads.reserve(out.bufs.size());
 
     for (auto& b : out.bufs) {
-        node_threads.emplace_back([&, node=b.node, ptr=b.ptr, rows=b.rows, row_start=b.row_start] {
+        node_threads.emplace_back([&, pb=&b] {
             int threads = params.threads_per_node;
             if (params.max_threads > 0) threads = std::min(threads, params.max_threads);
             threads = std::max(1, threads);
 
-            fill_rows_f32(ptr, rows, N, params.seed, row_start, threads, params.pin_threads, node);
+            fill_rows_f32(pb->ptr, pb->rows, N, params.seed, pb->row_start,
+                      threads, params.pin_threads, pb->node);
+
+            print_numa_residency(pb->ptr, pb->bytes);
+
+            cudaError_t st = cudaHostRegister(pb->ptr, pb->bytes, cudaHostRegisterDefault);
+            pb->pinned = (st == cudaSuccess);
+            if (st != cudaSuccess) {
+                std::cerr << "cudaHostRegister failed: " << cudaGetErrorString(st) << "\n";
+            }
         });
     }
 

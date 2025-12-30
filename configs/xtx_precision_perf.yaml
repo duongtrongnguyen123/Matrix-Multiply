@@ -1,25 +1,24 @@
 experiment:
     name: xtx_precision_perf
     seed: 1234
-    repeats: 3
-    warmup_iters: 1
+    repeats: 2
+    warmup_iters: 0
 
 matrix:
-    M: 1500000
+    M: 5000000
     N: 10000
     dtype_storage: fp32
     layout: row_major
 
 chunking: 
-    rows_per_chunk: 131072
+    rows_per_chunk: 50000
     pinned_buffers: 1
-    pinned_buffer_gb: 12
 
 host_memory:
   numa_mode: manual          # manual / auto (auto = detect nodes, default spread)
   placement:
-    - { node: 0, frac: 1 }
-    #- { node: 1, frac: 0 }
+    - { node: 0, frac: 0.5}
+    - { node: 1, frac: 0.5}
   threads_per_node: 32
   max_threads: 0
   pin_threads: true
@@ -42,7 +41,14 @@ modes:
       compute: fp32
       accumulate: fp32
       cublas_math_mode: DEFAULT
-      algorithm: syrk # / gemm
+      algorithm: syrk 
+
+    - name: fp32
+      input_dtype: fp32
+      compute: fp32
+      accumulate: fp32
+      cublas_math_mode: DEFAULT
+      algorithm: gemm
 
     - name: tf32
       input_dtype: fp32

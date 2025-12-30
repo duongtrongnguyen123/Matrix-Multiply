@@ -43,7 +43,7 @@ Config load_config_yaml(const std::string& path) {
         auto c = root["chunking"];
         if (c["rows_per_chunk"])   chunking.rows_per_chunk   = (c["rows_per_chunk"]).as<int64_t>();
         if (c["pinned_buffers"])   chunking.pinned_buffers   = c["pinned_buffers"].as<int>();
-        if (c["pinned_buffer_gb"]) chunking.pinned_buffer_gb = c["pinned_buffer_gb"].as<double>();
+        
     }
 
     if (root["host_memory"]) {

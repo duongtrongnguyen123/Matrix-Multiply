@@ -9,6 +9,7 @@ struct NodeBuffer {
     int64_t rows; 
     size_t bytes;
     float* ptr;
+    bool pinned = true;
 };
 
 struct GeneratedMatrix{

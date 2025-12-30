@@ -23,6 +23,11 @@ struct ComputeParams {
     float beta_rest;
 };
 
+struct GpuTimeTotal {
+    float gemm_ms = 0.f;
+    float h2d_ms  = 0.f;
+    float cast_ms = 0.f;
+};
 
 /*
  * Compute C = X^T X on GPU.
@@ -39,27 +44,8 @@ struct ComputeParams {
  * - Supports SYRK (half compute) or GEMM
  * - Accumulates in FP32
  */
-static void compute_xtx_gpu_mode(
-    const ComputeParams& params, int device_id,
-    const float *X_local, std::int64_t rows_local,
-    const float *X_remote, std::int64_t rows_remote,
-    float *C_out_row_major, bool copy_back
-);
 
-/*
- * Convenience wrapper.
- * Uses cfg.modes[0] if present, otherwise defaults to FP32.
- */
-void compute_xtx_gpu(
-    const Config& cfg,
-    const float* X_local,
-    std::int64_t rows_local,
-    const float* X_remote,
-    std::int64_t rows_remote,
-    float* C_out_rowmajor
-);
-
-void compute_xtx_multi_gpu(
+std::vector<GpuTimeTotal> compute_xtx_multi_device(
     const ComputeParams& params,
     const GeneratedMatrix& X,
     float* C_out_row_major
