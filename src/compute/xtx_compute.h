@@ -11,6 +11,7 @@ struct ComputeParams {
     int64_t N;
     int64_t rows_per_chunk;
     std::vector<DeviceCfg> devices;
+    std::string name;
     std::string input_dtype;
     std::string algorithm;
     std::string triangle;

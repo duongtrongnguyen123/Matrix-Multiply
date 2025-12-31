@@ -10,6 +10,7 @@
 #include <cuda_runtime.h>
 #include <fstream>
 #include <stdexcept>
+#include <tuple>
 
 #include <config/xtx_config.h>
 #include <generate/xtx_generate.h>
@@ -65,7 +66,7 @@ int main(int argc, char** argv) {
     // std::string out_path = (argc >= 3) ? argv[2] : " ";
     try {
         Config cfg = load_config_yaml(cfg_path);
-        size_t mode_idx = 2;           // choose algorithm
+        size_t mode_idx = 1;           // choose algorithm
         ModeCfg mode = cfg.modes[mode_idx];
         print_config(cfg, mode);
 
@@ -90,7 +91,8 @@ int main(int argc, char** argv) {
                         cfg.host_memory.numa_aware};
         ComputeParams  cp{cfg.matrix.N, 
                         cfg.chunking.rows_per_chunk, 
-                        cfg.devices,  
+                        cfg.devices,
+                        mode.name,
                         mode.input_dtype,
                         mode.algorithm, 
                         mode.triangle,
@@ -101,6 +103,9 @@ int main(int argc, char** argv) {
                         cfg.compute_scalars.alpha, 
                         cfg.compute_scalars.beta_first, cfg.compute_scalars.beta_rest};
 
+
+        // Initialize CUDA context before cudaHostRegister is called in threads
+        cudaFree(0);
 
         GeneratedMatrix X = generate_random_matrix_multi_numa(gp);
 
