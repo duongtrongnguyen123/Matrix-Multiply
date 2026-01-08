@@ -14,6 +14,8 @@ struct MatrixCfg {
 struct BenchmarkCfg {
     int repeats = 1;
     int warmup_iters = 0;
+    int mode_idx = 0;
+    bool double_buffering = true;
 };
 
 struct ChunkingCfg {

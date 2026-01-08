@@ -2,16 +2,18 @@ experiment:
     name: xtx_precision_perf
     seed: 1234
     repeats: 2
-    warmup_iters: 0
+    warmup_iters: 1
+    mode_idx: 2              # 0=fp32_syrk, 1=fp32_gemm, 2=tf32, 3=bf16, 4=fp16
+    double_buffering: true   # true=double buffering, false=single buffering
 
 matrix:
-    M: 300000
-    N: 10000
+    M: 393216
+    N: 8192
     dtype_storage: fp32
     layout: row_major
 
 chunking: 
-    rows_per_chunk: 10000
+    rows_per_chunk: 8192
     pinned_buffers: 1
 
 host_memory:

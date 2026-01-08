@@ -2,6 +2,7 @@
 #include <cuda_fp16.h>
 #include <cublas_v2.h>
 #include <cuda_bf16.h>
+#include <nvtx3/nvToolsExt.h>
 
 #include <cstdio>
 #include <cstring>
@@ -19,6 +20,68 @@
 #include <compute/xtx_cublas.h>
 #include <compute/xtx_cublasLt.h>
 
+
+// ========== GpuBuffers implementation ==========
+
+void GpuBuffers::allocate(int dev_id, int64_t N, int64_t rows_per_chunk,
+                          const std::string& dtype, bool double_buffering) {
+    device_id = dev_id;
+    is_double_buffering = double_buffering;
+    max_chunk_elems = static_cast<size_t>(rows_per_chunk) * static_cast<size_t>(N);
+
+    cuda_check(cudaSetDevice(device_id), "cudaSetDevice in GpuBuffers::allocate");
+
+    // Allocate output C (N x N)
+    bytes_C = static_cast<size_t>(N) * static_cast<size_t>(N) * sizeof(float);
+    cuda_check(cudaMalloc(reinterpret_cast<void**>(&dC), bytes_C), "cudaMalloc dC");
+
+    // Allocate input buffers
+    cuda_check(cudaMalloc(reinterpret_cast<void**>(&dX_ping), max_chunk_elems * sizeof(float)), "cudaMalloc dX_ping");
+
+    if (double_buffering) {
+        cuda_check(cudaMalloc(reinterpret_cast<void**>(&dX_pong), max_chunk_elems * sizeof(float)), "cudaMalloc dX_pong");
+    }
+
+    // Allocate casted buffers based on dtype
+    const bool want_fp16 = (dtype == "fp16");
+    const bool want_bf16 = (dtype == "bf16");
+
+    if (want_fp16) {
+        cuda_check(cudaMalloc(reinterpret_cast<void**>(&dXh_ping), max_chunk_elems * sizeof(__half)), "cudaMalloc dXh_ping");
+        if (double_buffering) {
+            cuda_check(cudaMalloc(reinterpret_cast<void**>(&dXh_pong), max_chunk_elems * sizeof(__half)), "cudaMalloc dXh_pong");
+        }
+    }
+
+    if (want_bf16) {
+        cuda_check(cudaMalloc(reinterpret_cast<void**>(&dXb_ping), max_chunk_elems * sizeof(__nv_bfloat16)), "cudaMalloc dXb_ping");
+        if (double_buffering) {
+            cuda_check(cudaMalloc(reinterpret_cast<void**>(&dXb_pong), max_chunk_elems * sizeof(__nv_bfloat16)), "cudaMalloc dXb_pong");
+        }
+    }
+}
+
+void GpuBuffers::free() {
+    if (device_id < 0) return;
+
+    cuda_check(cudaSetDevice(device_id), "cudaSetDevice in GpuBuffers::free");
+
+    if (dXb_pong) { cudaFree(dXb_pong); dXb_pong = nullptr; }
+    if (dXb_ping) { cudaFree(dXb_ping); dXb_ping = nullptr; }
+    if (dXh_pong) { cudaFree(dXh_pong); dXh_pong = nullptr; }
+    if (dXh_ping) { cudaFree(dXh_ping); dXh_ping = nullptr; }
+    if (dX_pong)  { cudaFree(dX_pong);  dX_pong = nullptr; }
+    if (dX_ping)  { cudaFree(dX_ping);  dX_ping = nullptr; }
+    if (dC)       { cudaFree(dC);       dC = nullptr; }
+
+    device_id = -1;
+}
+
+void GpuBuffers::reset_output(cudaStream_t stream) {
+    if (dC && bytes_C > 0) {
+        cuda_check(cudaMemsetAsync(dC, 0, bytes_C, stream), "cudaMemsetAsync dC reset");
+    }
+}
 
 // ===== quick cublasLt XTX test knobs =====
 static constexpr bool USE_CUBLASLT_XTX = false;
@@ -46,13 +109,17 @@ void compute_xtx_double_buffering (
         const float *X_local, std::int64_t rows_local,
         const float *X_remote, std::int64_t rows_remote,
         float *C_out_row_major, bool copy_back,
+        GpuBuffers& bufs,
         GpuTimeTotal& time
         ){
+    const ModeCfg& mode = params.mode;
+    const ComputeScalars& scalars = params.scalars;
     const int N = static_cast<int>(params.N);
 
     if (!C_out_row_major) {
         throw std::runtime_error("C_out_row_major must not be null");
     }
+
 
     cuda_check(cudaSetDevice(device_id), "cudaSetDevice");
 
@@ -65,44 +132,34 @@ void compute_xtx_double_buffering (
     cublas_check(cublasCreate(&handle), "cublasCreate handle");
     cublas_check(cublasSetStream(handle, stream_compute), "cublasSetStream");
 
-    cublasMath_t math_mode = parse_math_mode(params.cublas_math_mode);
+    cublasMath_t math_mode = parse_math_mode(mode.cublas_math_mode);
     cublas_check(cublasSetMathMode(handle, math_mode), "cublasSetMathMode");
 
-    // Single output
-    float *dC = nullptr;
-    size_t bytes_C = static_cast<size_t>(N) * static_cast<size_t>(N) * sizeof(float);
-    cuda_check(cudaMalloc(reinterpret_cast<void**>(&dC), bytes_C), "cudaMalloc dC");
-    cuda_check(cudaMemsetAsync(dC, 0, bytes_C, stream_compute), "cudaMemsetAsync dC");
+    // Use pre-allocated buffers
+    float* dC = bufs.dC;
+    size_t bytes_C = bufs.bytes_C;
+    bufs.reset_output(stream_compute);  // zero out dC
 
-    const int64_t rows_per_chunk = params.rows_per_chunk;
-    const size_t max_chunk_elems = static_cast<size_t>(rows_per_chunk) * static_cast<size_t>(N);
+    const int64_t rows_per_chunk = params.chunking.rows_per_chunk;
 
-    // Double buffer for input: ping and pong
-    float *dX_ping = nullptr, *dX_pong = nullptr;
-    cuda_check(cudaMalloc(reinterpret_cast<void**>(&dX_ping), max_chunk_elems * sizeof(float)), "cudaMalloc dX_ping");
-    cuda_check(cudaMalloc(reinterpret_cast<void**>(&dX_pong), max_chunk_elems * sizeof(float)), "cudaMalloc dX_pong");
+    // Double buffer for input: ping and pong (pre-allocated)
+    float* dX_ping = bufs.dX_ping;
+    float* dX_pong = bufs.dX_pong;
 
-    __half *dXh_ping = nullptr, *dXh_pong = nullptr;
-    __nv_bfloat16 *dXb_ping = nullptr, *dXb_pong = nullptr;
+    __half* dXh_ping = bufs.dXh_ping;
+    __half* dXh_pong = bufs.dXh_pong;
+    __nv_bfloat16* dXb_ping = bufs.dXb_ping;
+    __nv_bfloat16* dXb_pong = bufs.dXb_pong;
 
     // compute type
-    std::string dtype = params.name;
+    const std::string& dtype = mode.name;
 
     const bool want_fp16 = (dtype == "fp16");
     const bool want_bf16 = (dtype == "bf16");
     const bool want_tf32 = (dtype == "tf32");
     const bool want_fp32 = (!want_fp16 && !want_bf16 && !want_tf32);
 
-    if (want_fp16) {
-        cuda_check(cudaMalloc(reinterpret_cast<void**>(&dXh_ping), max_chunk_elems * sizeof(__half)), "cudaMalloc fp16 ping");
-        cuda_check(cudaMalloc(reinterpret_cast<void**>(&dXh_pong), max_chunk_elems * sizeof(__half)), "cudaMalloc fp16 pong");
-    }
-    if (want_bf16) {
-        cuda_check(cudaMalloc(reinterpret_cast<void**>(&dXb_ping), max_chunk_elems * sizeof(__nv_bfloat16)), "cudaMalloc bf16 ping");
-        cuda_check(cudaMalloc(reinterpret_cast<void**>(&dXb_pong), max_chunk_elems * sizeof(__nv_bfloat16)), "cudaMalloc bf16 pong");
-    }
-
-    const cublasFillMode_t uplo = parse_triangle(params.triangle);
+    const cublasFillMode_t uplo = parse_triangle(mode.triangle);
 
     int max_chunks = (rows_local + rows_per_chunk - 1) / rows_per_chunk +
                      (rows_remote + rows_per_chunk - 1) / rows_per_chunk;
@@ -124,6 +181,11 @@ void compute_xtx_double_buffering (
     cudaEvent_t h2d_done, compute_done;
     cudaEventCreate(&h2d_done);
     cudaEventCreate(&compute_done);
+
+    // Overall timing events (to measure actual elapsed, not sum of overlapping)
+    cudaEvent_t overall_start, overall_stop;
+    cudaEventCreate(&overall_start);
+    cudaEventCreate(&overall_stop);
 
     int chunk_id = 0;
     bool use_ping = true;
@@ -150,14 +212,8 @@ void compute_xtx_double_buffering (
     if (X_remote && rows_remote > 0) add_chunks(X_remote, rows_remote, false);
 
     if (chunks.empty()) {
-        // Nothing to process, cleanup and return
-        cudaFree(dC);
-        cudaFree(dX_ping);
-        cudaFree(dX_pong);
-        if (dXh_ping) cudaFree(dXh_ping);
-        if (dXh_pong) cudaFree(dXh_pong);
-        if (dXb_ping) cudaFree(dXb_ping);
-        if (dXb_pong) cudaFree(dXb_pong);
+        // Nothing to process, cleanup streams/handles and return
+        // Note: buffers are pre-allocated, don't free them here
         cudaEventDestroy(h2d_done);
         cudaEventDestroy(compute_done);
         cublasDestroy(handle);
@@ -169,10 +225,10 @@ void compute_xtx_double_buffering (
     // Helper lambda to run compute on a buffer
     auto run_compute = [&](float* dXf, __half* dXh, __nv_bfloat16* dXb,
                            int64_t K, size_t elems, float beta, int cid) {
-        const float alpha = params.alpha;
+        const float alpha = scalars.alpha;
 
         if (want_fp32) {
-            if (params.algorithm == "syrk") {
+            if (mode.algorithm == "syrk") {
                 run_1_chunk_fp32_syrk(handle, uplo, N, static_cast<int>(K), dXf, dC, alpha, beta);
             } else {
                 if (USE_CUBLASLT_XTX) {
@@ -186,7 +242,7 @@ void compute_xtx_double_buffering (
                 }
             }
         } else if (want_tf32) {
-            if (params.algorithm == "syrk") {
+            if (mode.algorithm == "syrk") {
                 run_1_chunk_fp32_syrk(handle, uplo, N, static_cast<int>(K), dXf, dC, alpha, beta);
             } else {
                 if (USE_CUBLASLT_XTX) {
@@ -230,21 +286,25 @@ void compute_xtx_double_buffering (
     };
 
     // Prime the pipeline: start H2D for first chunk
+    nvtxRangePush("XTX_double_buffer");
+    cudaEventRecord(overall_start, stream_h2d);  // Mark start of all GPU work
     {
         const auto& c = chunks[0];
         const size_t elems = static_cast<size_t>(c.rows) * static_cast<size_t>(N);
+        nvtxRangePush("H2D_chunk_0");
         cudaEventRecord(h2d_start[0], stream_h2d);
         cuda_check(cudaMemcpyAsync(dX_ping, c.src + c.offset * N, elems * sizeof(float),
                                    cudaMemcpyHostToDevice, stream_h2d), "H2D chunk 0");
         cudaEventRecord(h2d_stop[0], stream_h2d);
         cudaEventRecord(h2d_done, stream_h2d);
+        nvtxRangePop();
     }
 
     // Process all chunks with double buffering
     for (size_t i = 0; i < chunks.size(); ++i) {
         const auto& c = chunks[i];
         const size_t elems = static_cast<size_t>(c.rows) * static_cast<size_t>(N);
-        const float beta = c.is_first ? params.beta_first : params.beta_rest;
+        const float beta = c.is_first ? scalars.beta_first : scalars.beta_rest;
 
         float* dXf_curr = use_ping ? dX_ping : dX_pong;
         float* dXf_next = use_ping ? dX_pong : dX_ping;
@@ -274,15 +334,24 @@ void compute_xtx_double_buffering (
         }
 
         // Run compute on current chunk
+        {
+            char buf[64];
+            snprintf(buf, sizeof(buf), "GEMM_chunk_%zu", i);
+            nvtxRangePush(buf);
+        }
         run_compute(dXf_curr, dXh_curr, dXb_curr, c.rows, elems, beta, static_cast<int>(i));
+        nvtxRangePop();
         cudaEventRecord(compute_done, stream_compute);
 
         use_ping = !use_ping;
         chunk_id++;
     }
 
+    // Record overall stop after all chunks processed
+    cudaEventRecord(overall_stop, stream_compute);
+
     // Mirror triangle if using syrk
-    if (want_fp32 && params.algorithm == "syrk") {
+    if (want_fp32 && mode.algorithm == "syrk") {
         dim3 block(16, 16);
         dim3 grid((N + block.x - 1) / block.x, (N + block.y - 1) / block.y);
         const int upper_from_lower = (uplo == CUBLAS_FILL_MODE_LOWER) ? 1 : 0;
@@ -297,6 +366,7 @@ void compute_xtx_double_buffering (
     }
     cuda_check(cudaStreamSynchronize(stream_compute), "sync compute stream");
     cuda_check(cudaStreamSynchronize(stream_h2d), "sync h2d stream");
+    nvtxRangePop();  // XTX_double_buffer
 
     // Collect timing
     float gemm_ms_total = 0.0f;
@@ -321,6 +391,11 @@ void compute_xtx_double_buffering (
     time.h2d_ms  = h2d_ms_total;
     time.cast_ms = cast_ms_total;
 
+    // Measure actual elapsed time (accounts for H2D/GEMM overlap)
+    float overall_elapsed = 0.f;
+    cudaEventElapsedTime(&overall_elapsed, overall_start, overall_stop);
+    time.total_elapsed_ms = overall_elapsed;
+
     // Cleanup events
     for (int i = 0; i < max_chunks; ++i) {
         cudaEventDestroy(gemm_start[i]);
@@ -332,15 +407,10 @@ void compute_xtx_double_buffering (
     }
     cudaEventDestroy(h2d_done);
     cudaEventDestroy(compute_done);
+    cudaEventDestroy(overall_start);
+    cudaEventDestroy(overall_stop);
 
-    // Cleanup buffers
-    if (dXb_pong) cudaFree(dXb_pong);
-    if (dXb_ping) cudaFree(dXb_ping);
-    if (dXh_pong) cudaFree(dXh_pong);
-    if (dXh_ping) cudaFree(dXh_ping);
-    cudaFree(dX_pong);
-    cudaFree(dX_ping);
-    cudaFree(dC);
+    // Cleanup handles and streams only (buffers are pre-allocated, freed externally)
     cublasDestroy(handle);
     cudaStreamDestroy(stream_h2d);
     cudaStreamDestroy(stream_compute);
@@ -351,8 +421,11 @@ static void compute_xtx_single_device(
         const float *X_local, std::int64_t rows_local,
         const float *X_remote, std::int64_t rows_remote,
         float *C_out_row_major, bool copy_back,
+        GpuBuffers& bufs,
         GpuTimeTotal& time
         ) {
+    const ModeCfg& mode = params.mode;
+    const ComputeScalars& scalars = params.scalars;
     const int N = static_cast<int> (params.N);
 
     if (!C_out_row_major) {
@@ -360,7 +433,7 @@ static void compute_xtx_single_device(
     }
 
     cuda_check(cudaSetDevice(device_id), "CudaSetDevice");
-    
+
     cudaStream_t stream;
     cuda_check(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking), "cudaStreamCreate");
 
@@ -368,41 +441,33 @@ static void compute_xtx_single_device(
     cublas_check(cublasCreate(&handle), "cublasCreate");
     cublas_check(cublasSetStream(handle, stream), "cublasSetStream");
 
-    cublasMath_t math_mode = parse_math_mode(params.cublas_math_mode);
+    cublasMath_t math_mode = parse_math_mode(mode.cublas_math_mode);
     cublas_check(cublasSetMathMode(handle, math_mode), "cublasSetMathMode");
 
-    // output C on device
-    float* dC = nullptr;
-    size_t bytesC = static_cast<size_t> (N) *static_cast<size_t> (N) * sizeof(float);
-    cuda_check(cudaMalloc(reinterpret_cast<void**>(&dC), bytesC), "cudaMalloc dC");
-    cuda_check(cudaMemsetAsync(dC, 0, bytesC, stream), "cudaMemsetAsync dC");
+    // Use pre-allocated buffers
+    float* dC = bufs.dC;
+    size_t bytesC = bufs.bytes_C;
+    bufs.reset_output(stream);  // zero out dC
 
-    const int64_t rows_per_chunk = params.rows_per_chunk;
-    const size_t max_chunk_elems = static_cast<size_t> (rows_per_chunk) * static_cast<size_t> (N);
+    const int64_t rows_per_chunk = params.chunking.rows_per_chunk;
 
-    float *dXf = nullptr;
-    cuda_check(cudaMalloc(reinterpret_cast<void**>(&dXf), max_chunk_elems * sizeof(float)), "cudaMalloc");
+    // Single buffer for input (pre-allocated as dX_ping)
+    float* dXf = bufs.dX_ping;
 
-    __half *dXh = nullptr;
-    __nv_bfloat16 *dXb = nullptr;
-    
+    // Casted buffers (pre-allocated)
+    __half* dXh = bufs.dXh_ping;
+    __nv_bfloat16* dXb = bufs.dXb_ping;
 
     // compute type
-    std::string dtype = params.name;
+    const std::string& dtype = mode.name;
 
     const bool want_fp16 = (dtype == "fp16");
     const bool want_bf16 = (dtype == "bf16");
     const bool want_tf32 = (dtype == "tf32");
     const bool want_fp32 = (!want_fp16 && !want_bf16 && !want_tf32);
-    if (want_fp16) cuda_check(
-                        cudaMalloc(reinterpret_cast<void**>(&dXh),                        max_chunk_elems * sizeof(__half)), 
-                        "cudaMallocfp16");
-    if (want_bf16) cuda_check(
-                        cudaMalloc(reinterpret_cast<void**>(&dXb),                        max_chunk_elems * sizeof(__nv_bfloat16)),
-                        "cudaMallocbf16");
     
     // timer to time H2D time, compute time, casting time
-    const cublasFillMode_t uplo = parse_triangle(params.triangle);
+    const cublasFillMode_t uplo = parse_triangle(mode.triangle);
 
     int max_chunks = (rows_local + rows_per_chunk - 1) / rows_per_chunk +
                      (rows_remote + rows_per_chunk - 1) / rows_per_chunk;
@@ -438,16 +503,16 @@ static void compute_xtx_single_device(
                                     ), 
                     "cudaMemcpuAsync dXf -> X"
             );
-            cudaEventRecord(h2d_stop[chunk_id], stream);     
+            cudaEventRecord(h2d_stop[chunk_id], stream);
             // stop H2D timer
 
-            const float alpha = params.alpha;
-            const float beta  = (done == 0 && X == X_local) ? params.beta_first : params.beta_rest;
+            const float alpha = scalars.alpha;
+            const float beta  = (done == 0 && X == X_local) ? scalars.beta_first : scalars.beta_rest;
 
-            
+
             if (want_fp32) {
-                
-                if (params.algorithm == "syrk") {
+
+                if (mode.algorithm == "syrk") {
                     run_1_chunk_fp32_syrk(handle, uplo,
                                           N, static_cast<int> (K), 
                                           dXf, dC,
@@ -475,7 +540,7 @@ static void compute_xtx_single_device(
                 }
             }
             else if (want_tf32) {
-                if (params.algorithm == "syrk") {
+                if (mode.algorithm == "syrk") {
                     // preserve same logic as fp32 path
                     run_1_chunk_fp32_syrk(handle, uplo,
                                           N, static_cast<int>(K),
@@ -555,8 +620,8 @@ static void compute_xtx_single_device(
     if (X_local && rows_local > 0)  process_source(X_local, rows_local);
     if (X_remote && rows_remote > 0) process_source(X_remote, rows_remote);
 
-    
-    if (want_fp32 && params.algorithm == "syrk") {
+
+    if (want_fp32 && mode.algorithm == "syrk") {
         dim3 block(16, 16);
         dim3 grid((N + block.x - 1) / block.x, (N + block.y - 1) / block.y);
         const int upper_from_lower = (uplo == CUBLAS_FILL_MODE_LOWER) ? 1 : 0;
@@ -593,12 +658,10 @@ static void compute_xtx_single_device(
     time.gemm_ms = gemm_ms_total;
     time.h2d_ms  = h2d_ms_total;
     time.cast_ms = cast_ms_total;
+    // No overlap in single buffering, so total = sum of components
+    time.total_elapsed_ms = h2d_ms_total + cast_ms_total + gemm_ms_total;
 
-
-    if (dXb) cudaFree(dXb);
-    if (dXh) cudaFree(dXh);
-    cudaFree(dXf);
-    cudaFree(dC);
+    // Cleanup handles and streams only (buffers are pre-allocated, freed externally)
     cublasDestroy(handle);
     cudaStreamDestroy(stream);
 }
@@ -609,7 +672,8 @@ static void compute_xtx_single_device(
 std::vector<GpuTimeTotal> compute_xtx_multi_device(
     const ComputeParams& params,
     const GeneratedMatrix& X,
-    float* C_out_row_major
+    float* C_out_row_major,
+    std::vector<GpuBuffers>& gpu_buffers
 ) {
     int visible = 0;
     cuda_check(cudaGetDeviceCount(&visible), "cudaGetDeviceCount");
@@ -653,26 +717,29 @@ std::vector<GpuTimeTotal> compute_xtx_multi_device(
         }
         
         
-        compute_xtx_double_buffering(
-            params, device_id,
-            src0->ptr, src0->rows,
-            src1 ? src1->ptr : nullptr,
-            src1 ? src1->rows : 0,
-            C_out_row_major, false,
-            times[0]);
+        if (params.double_buffering) {
+            compute_xtx_double_buffering(
+                params, device_id,
+                src0->ptr, src0->rows,
+                src1 ? src1->ptr : nullptr,
+                src1 ? src1->rows : 0,
+                C_out_row_major, false,
+                gpu_buffers[0],
+                times[0]);
+        } else {
+            compute_xtx_single_device(
+                params, device_id,
+                src0->ptr, src0->rows,
+                src1 ? src1->ptr : nullptr,
+                src1 ? src1->rows : 0,
+                C_out_row_major, false,
+                gpu_buffers[0],
+                times[0]);
+        }
         return times;
     }
 
 
-
-
-    const int64_t N = params.N;
-    const size_t C_elems = static_cast<size_t> (N) * static_cast<size_t> (N);
-
-    // one partial C per USED GPU (not per visible GPU)
-    std::vector<std::vector<float>> C_partial(
-        used, std::vector<float>(C_elems, 0.0f)
-    );
 
     std::vector<std::thread> gpu_threads;
     gpu_threads.reserve(used);
@@ -695,26 +762,30 @@ std::vector<GpuTimeTotal> compute_xtx_multi_device(
             if (!buf) buf = &X.bufs[0]; // fallback
 
             // compute partial C on this GPU
-            compute_xtx_double_buffering(
-                params, device_id,
-                buf->ptr, buf->rows,   // X_local
-                nullptr, 0,            // X_remote unused in multi-GPU
-                C_partial[i].data(), false,
-                times[i]);
+            if (params.double_buffering) {
+                compute_xtx_double_buffering(
+                    params, device_id,
+                    buf->ptr, buf->rows,   // X_local
+                    nullptr, 0,            // X_remote unused in multi-GPU
+                    C_out_row_major, false,
+                    gpu_buffers[i],
+                    times[i]);
+            } else {
+                compute_xtx_single_device(
+                    params, device_id,
+                    buf->ptr, buf->rows,   // X_local
+                    nullptr, 0,            // X_remote unused in multi-GPU
+                    C_out_row_major, false,
+                    gpu_buffers[i],
+                    times[i]);
+            }
         });
     }
 
     for (auto& t : gpu_threads) t.join();
 
-    // reduce partials on CPU (multi-threaded)
-    #pragma omp parallel for schedule(static)
-    for (size_t k = 0; k < C_elems; ++k) {
-        float sum = 0.0f;
-        for (int i = 0; i < used; ++i) {
-            sum += C_partial[i][k];
-        }
-        C_out_row_major[k] = sum;
-    }
+    // TODO: Multi-GPU reduction not yet implemented
+    // Each GPU currently writes to C_out_row_major directly (accumulates in-place)
     return times;
 }
 

@@ -21,7 +21,6 @@
     #include <omp.h>
 #endif
 
-#include <config/xtx_config.h>
 #include "generate/xtx_generate.h"
 
 // hash function
@@ -67,11 +66,13 @@ void print_numa_residency(void* ptr, size_t bytes) {
     int pages = bytes / page;
 
     std::vector<void*> addrs;
-    std::vector<int> status(pages);
+    addrs.reserve((pages + 255) / 256);
 
     for (int i = 0; i < pages; i += 256) { // sample pages
         addrs.push_back((char*)ptr + (size_t)i * page);
     }
+
+    std::vector<int> status(addrs.size());  // size to match sampled pages
 
     move_pages(0, addrs.size(), addrs.data(), nullptr, status.data(), 0);
 
@@ -81,7 +82,7 @@ void print_numa_residency(void* ptr, size_t bytes) {
         if (s == 1) n1++;
     }
 
-    printf("NUMA residency: N0=%d  N1=%d\n", n0, n1);
+    printf("NUMA residency: N0=%d  N1=%d (sampled %zu pages)\n", n0, n1, addrs.size());
 }
 
 
@@ -100,7 +101,7 @@ static std::vector<int64_t> split_rows_by_frac(int64_t M, const std::vector<Node
     return rows;
 }
 
-static void pin_thread_to_numa_node(int node) {
+void pin_thread_to_numa_node(int node) {
     cpu_set_t cpuset;
     CPU_ZERO(&cpuset);
 
@@ -158,14 +159,17 @@ static void fill_rows_f32(float* base, int64_t rows, int64_t N, uint64_t seed,
 GeneratedMatrix generate_random_matrix_multi_numa(
         const GenerateParams& params
 ) {
-    GeneratedMatrix out;
-    out.M = params.M;
-    out.N = params.N;
+    const MatrixCfg& matrix = params.matrix;
+    const HostMemoryCfg& host = params.host_memory;
 
-    const int64_t M = params.M;
-    const int64_t N = params.N;
-    
-    if (!params.numa_aware || params.placement.empty()) {
+    GeneratedMatrix out;
+    out.M = matrix.M;
+    out.N = matrix.N;
+
+    const int64_t M = matrix.M;
+    const int64_t N = matrix.N;
+
+    if (!host.numa_aware || host.placement.empty()) {
         // fallback: single node 0
         NodeFrac nf{0, 1.0};
         std::vector<NodeFrac> placement{nf};
@@ -180,28 +184,28 @@ GeneratedMatrix generate_random_matrix_multi_numa(
         b.ptr = static_cast<float*> (numa_alloc_or_throw(bytes, b.node));
 
 
-        int threads = (params.max_threads > 0) ? std::min(params.max_threads, params.threads_per_node)
-                                               : params.threads_per_node;
+        int threads = (host.max_threads > 0) ? std::min(host.max_threads, host.threads_per_node)
+                                             : host.threads_per_node;
         threads = std::max(1, threads);
 
-        fill_rows_f32(b.ptr, b.rows, N, params.seed, b.row_start, threads, params.pin_threads, b.node);
+        fill_rows_f32(b.ptr, b.rows, N, matrix.seed, b.row_start, threads, host.pin_threads, b.node);
 
         cudaError_t st = cudaHostRegister(b.ptr, b.bytes, cudaHostRegisterDefault);
         if (st == cudaSuccess) {
             b.pinned = true;
-        } 
+        }
         else {
             b.pinned = false;
             cudaGetLastError(); // clear sticky error if you want
             std::cout << "false here" << std::endl;
-}
+        }
 
         out.bufs.push_back(b);
         return out;
     }
 
 
-    auto rows_per = split_rows_by_frac(M, params.placement);
+    auto rows_per = split_rows_by_frac(M, host.placement);
 
     int64_t row_cursor = 0;
     out.bufs.reserve(rows_per.size());
@@ -209,7 +213,7 @@ GeneratedMatrix generate_random_matrix_multi_numa(
     for (size_t i = 0 ; i < rows_per.size() ; i ++ ) {
         NodeBuffer b;
 
-        int node = params.placement[i].node;
+        int node = host.placement[i].node;
         int64_t row = rows_per[i];
         b.row_start = row_cursor;
         b.rows = row;
@@ -219,7 +223,7 @@ GeneratedMatrix generate_random_matrix_multi_numa(
         b.bytes = bytes;
 
         b.ptr = static_cast<float*> (numa_alloc_or_throw(bytes, b.node));
-        
+
         out.bufs.push_back(b);
 
         row_cursor += row;
@@ -230,12 +234,12 @@ GeneratedMatrix generate_random_matrix_multi_numa(
 
     for (auto& b : out.bufs) {
         node_threads.emplace_back([&, pb=&b] {
-            int threads = params.threads_per_node;
-            if (params.max_threads > 0) threads = std::min(threads, params.max_threads);
+            int threads = host.threads_per_node;
+            if (host.max_threads > 0) threads = std::min(threads, host.max_threads);
             threads = std::max(1, threads);
 
-            fill_rows_f32(pb->ptr, pb->rows, N, params.seed, pb->row_start,
-                      threads, params.pin_threads, pb->node);
+            fill_rows_f32(pb->ptr, pb->rows, N, matrix.seed, pb->row_start,
+                      threads, host.pin_threads, pb->node);
 
             print_numa_residency(pb->ptr, pb->bytes);
 

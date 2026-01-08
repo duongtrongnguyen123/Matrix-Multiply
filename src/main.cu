@@ -8,6 +8,7 @@
 #include <chrono>
 #include <algorithm>
 #include <cuda_runtime.h>
+#include <cuda_profiler_api.h>
 #include <fstream>
 #include <stdexcept>
 #include <tuple>
@@ -42,6 +43,8 @@ static void print_config(const Config& cfg, const ModeCfg& mode) {
     std::cout  << "name         " << mode.name << std::endl;
     //std::cout  << "triangle     " << cfg.triangle << std::endl;
     std::cout  << "repeats      " << cfg.benchmark.repeats << std::endl;
+    std::cout  << "mode_idx     " << cfg.benchmark.mode_idx << std::endl;
+    std::cout  << "double_buf   " << (cfg.benchmark.double_buffering ? "true" : "false") << std::endl;
     
     for (size_t i = 0 ; i < cfg.modes.size() ; i ++ ) {
         std::cout << " | input dtype = " << cfg.modes[i].input_dtype << std::endl;
@@ -66,10 +69,9 @@ int main(int argc, char** argv) {
     // std::string out_path = (argc >= 3) ? argv[2] : " ";
     try {
         Config cfg = load_config_yaml(cfg_path);
-        size_t mode_idx = 1;           // choose algorithm
+        size_t mode_idx = cfg.benchmark.mode_idx;
         ModeCfg mode = cfg.modes[mode_idx];
         print_config(cfg, mode);
-
 
         std::vector<double> FLOPSs(cfg.modes.size(), 0);
         for (auto& FLOP:FLOPSs) {
@@ -82,26 +84,8 @@ int main(int argc, char** argv) {
             * (double)cfg.matrix.M
             * (double)cfg.matrix.N
             * (double)(cfg.matrix.N + 1);
-        GenerateParams gp{cfg.matrix.M, cfg.matrix.N, 
-                        cfg.matrix.seed, 
-                        cfg.host_memory.placement,
-                        cfg.host_memory.threads_per_node,
-                        cfg.host_memory.max_threads,
-                        cfg.host_memory.pin_threads,
-                        cfg.host_memory.numa_aware};
-        ComputeParams  cp{cfg.matrix.N, 
-                        cfg.chunking.rows_per_chunk, 
-                        cfg.devices,
-                        mode.name,
-                        mode.input_dtype,
-                        mode.algorithm, 
-                        mode.triangle,
-                        mode.compute,
-                        mode.cublas_math_mode,
-                        mode.accumulate,
-
-                        cfg.compute_scalars.alpha, 
-                        cfg.compute_scalars.beta_first, cfg.compute_scalars.beta_rest};
+        GenerateParams gp{cfg.matrix, cfg.host_memory};
+        ComputeParams  cp{cfg.chunking, cfg.devices, mode, cfg.compute_scalars, cfg.matrix.N, cfg.benchmark.double_buffering};
 
 
         // Initialize CUDA context before cudaHostRegister is called in threads
@@ -109,14 +93,49 @@ int main(int argc, char** argv) {
 
         GeneratedMatrix X = generate_random_matrix_multi_numa(gp);
 
-        
-        std::vector<float> C(static_cast<size_t> (cfg.matrix.N) * cfg.matrix.N, 0.0f);
-        
+        size_t C_elems  = static_cast<size_t> (cfg.matrix.N) * static_cast<size_t> (cfg.matrix.N);
+        size_t C_bytes  = C_elems * sizeof(float);
+
+        int home_node = /* gpu_node[home_gpu] */ 0;
+
+        float* C = reinterpret_cast<float*> (numa_alloc_onnode(C_bytes, home_node));
+        if (!C) throw std::runtime_error("numa_alloc_onnode failed");
+
+        // (optional but recommended) first-touch to really back pages on that node
+        #pragma omp parallel
+        {
+            pin_thread_to_numa_node(home_node);   // if you have it; otherwise omit
+            #pragma omp for schedule(static)
+            for (size_t k = 0; k < C_elems; ++k) C[k] = 0.0f;
+        }
+
+        // ---- Pre-allocate GPU buffers (outside timing) ----
+        const size_t num_devices = cfg.devices.size();
+        std::vector<GpuBuffers> gpu_buffers(num_devices);
+        for (size_t i = 0; i < num_devices; ++i) {
+            gpu_buffers[i].allocate(
+                cfg.devices[i].device_id,
+                cfg.matrix.N,
+                cfg.chunking.rows_per_chunk,
+                mode.name,
+                cfg.benchmark.double_buffering
+            );
+        }
+
         // ---- warmup ----
         for (int w = 0; w < cfg.benchmark.warmup_iters; ++w) {
-            std::fill(C.begin(), C.end(), 0.0f);
-            (void)compute_xtx_multi_device(cp, X, C.data());
+             #pragma omp parallel
+            {
+                pin_thread_to_numa_node(home_node);
+                #pragma omp for schedule(static)
+                for (size_t k = 0; k < C_elems; ++k) C[k] = 0.0f;
+            }
+            (void)compute_xtx_multi_device(cp, X, C, gpu_buffers);
         }
+        cudaDeviceSynchronize();
+
+        // ---- profiler start (after warmup) ----
+        cudaProfilerStart();
 
         // ---- benchmark ----
         const int R = std::max(1, cfg.benchmark.repeats);
@@ -133,42 +152,48 @@ int main(int argc, char** argv) {
         gemm_times.reserve(R);
         
         for (int i = 0; i < R; ++i) {
-            std::fill(C.begin(), C.end(), 0.0f);
         
             const double t0 = now_sec();
         
             // returns per-GPU stats
             std::vector<GpuTimeTotal> gpu_stats =
-                compute_xtx_multi_device(cp, X, C.data());
+                compute_xtx_multi_device(cp, X, C, gpu_buffers);
         
             const double t1 = now_sec();
             const double wall_dt = t1 - t0;   // seconds
             times.push_back(wall_dt);
         
-            // ---- SUM across GPUs (total GPU work) ----
+            // ---- MAX across GPUs (parallel execution time) ----
             double h2d_ms  = 0.0;
             double cast_ms = 0.0;
             double gemm_ms = 0.0;
-        
+            double total_elapsed_ms = 0.0;
+
             for (const auto& g : gpu_stats) {
-                h2d_ms  += g.h2d_ms;
-                cast_ms += g.cast_ms;
-                gemm_ms += g.gemm_ms;
+                h2d_ms  = std::max(h2d_ms,  (double)g.h2d_ms);
+                cast_ms = std::max(cast_ms, (double)g.cast_ms);
+                gemm_ms = std::max(gemm_ms, (double)g.gemm_ms);
+                total_elapsed_ms = std::max(total_elapsed_ms, (double)g.total_elapsed_ms);
             }
-        
+
             // convert ms -> seconds
             const double h2d_s  = h2d_ms  * 1e-3;
             const double cast_s = cast_ms * 1e-3;
             const double gemm_s = gemm_ms * 1e-3;
-        
+            const double elapsed_s = total_elapsed_ms * 1e-3;
+
             h2d_times.push_back(h2d_s);
             cast_times.push_back(cast_s);
             gemm_times.push_back(gemm_s);
-        
-            gpu_times.push_back(h2d_s + cast_s + gemm_s);
+
+            // Use actual elapsed (accounts for overlap) instead of sum
+            gpu_times.push_back(elapsed_s);
         }
 
-        
+        // ---- profiler stop ----
+        cudaDeviceSynchronize();
+        cudaProfilerStop();
+
         // ---- summary helpers ----
         auto stats = [](std::vector<double> v) {
             std::sort(v.begin(), v.end());
@@ -216,11 +241,16 @@ int main(int argc, char** argv) {
         
         std::cout << "===================\n\n";
 
+        // ---- Free GPU buffers (outside timing) ----
+        for (auto& buf : gpu_buffers) {
+            buf.free();
+        }
+
         /*
        // 6) Save result for further calculations
        if (!save_npy_fp32(out_path, C.data(), cfg.matrix.N)) {
            std::cerr << "[warn] failed to save npy to: " << out_path << "\n";
-       } 
+       }
        else {
            std::cout << "Saved C to: " << out_path << "\n";
        }

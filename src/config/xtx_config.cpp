@@ -29,6 +29,8 @@ Config load_config_yaml(const std::string& path) {
         if (e["seed"]) matrix.seed = e["seed"].as<uint64_t>();
         if (e["repeats"])      benchmark.repeats      = e["repeats"].as<int>();
         if (e["warmup_iters"]) benchmark.warmup_iters = e["warmup_iters"].as<int>();
+        if (e["mode_idx"])          benchmark.mode_idx          = e["mode_idx"].as<int>();
+        if (e["double_buffering"])  benchmark.double_buffering  = e["double_buffering"].as<bool>();
     }
 
     if (root["matrix"]) {
