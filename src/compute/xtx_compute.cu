@@ -229,7 +229,9 @@ void compute_xtx_double_buffering (
 
         if (want_fp32) {
             if (mode.algorithm == "syrk") {
+                cudaEventRecord(gemm_start[cid], stream_compute);
                 run_1_chunk_fp32_syrk(handle, uplo, N, static_cast<int>(K), dXf, dC, alpha, beta);
+                cudaEventRecord(gemm_stop[cid], stream_compute);    
             } else {
                 if (USE_CUBLASLT_XTX) {
                     run_1_chunk_fp32_xtx_cublaslt(
@@ -660,7 +662,7 @@ static void compute_xtx_single_device(
     time.cast_ms = cast_ms_total;
     // No overlap in single buffering, so total = sum of components
     time.total_elapsed_ms = h2d_ms_total + cast_ms_total + gemm_ms_total;
-
+    
     // Cleanup handles and streams only (buffers are pre-allocated, freed externally)
     cublasDestroy(handle);
     cudaStreamDestroy(stream);
@@ -675,21 +677,7 @@ std::vector<GpuTimeTotal> compute_xtx_multi_device(
     float* C_out_row_major,
     std::vector<GpuBuffers>& gpu_buffers
 ) {
-    int visible = 0;
-    cuda_check(cudaGetDeviceCount(&visible), "cudaGetDeviceCount");
-
     const int used = (int)params.devices.size();
-    if (used == 0) throw std::runtime_error("params.devices is empty");
-
-    // validate YAML device ids exist at runtime
-    for (const auto& d : params.devices) {
-        if (d.device_id < 0 || d.device_id >= visible) {
-            throw std::runtime_error(
-                "YAML device_id " + std::to_string(d.device_id) +
-                " not visible at runtime (visible=" + std::to_string(visible) + ")"
-            );
-        }
-    }
 
     // times
     std::vector<GpuTimeTotal> times(used);
@@ -743,7 +731,7 @@ std::vector<GpuTimeTotal> compute_xtx_multi_device(
 
     std::vector<std::thread> gpu_threads;
     gpu_threads.reserve(used);
-
+   
     // else launch exactly the GPUs specified in YAML
     for (int i = 0; i < used; ++i) {
         const int device_id = params.devices[i].device_id;
@@ -788,7 +776,5 @@ std::vector<GpuTimeTotal> compute_xtx_multi_device(
     // Each GPU currently writes to C_out_row_major directly (accumulates in-place)
     return times;
 }
-
-
 
 

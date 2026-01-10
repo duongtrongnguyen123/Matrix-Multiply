@@ -1,27 +1,27 @@
 experiment:
     name: xtx_precision_perf
     seed: 1234
-    repeats: 2
+    repeats: 3
     warmup_iters: 1
-    mode_idx: 2              # 0=fp32_syrk, 1=fp32_gemm, 2=tf32, 3=bf16, 4=fp16
+    mode_idx: 3             # 0=fp32_syrk, 1=fp32_gemm, 2=tf32, 3=bf16, 4=fp16
     double_buffering: true   # true=double buffering, false=single buffering
 
 matrix:
-    M: 393216
-    N: 8192
+    M: 2097152 #1048576 
+    N: 16384
     dtype_storage: fp32
     layout: row_major
 
 chunking: 
-    rows_per_chunk: 8192
+    rows_per_chunk: 16384
     pinned_buffers: 1
 
 host_memory:
   numa_mode: manual          # manual / auto (auto = detect nodes, default spread)
   placement:
-    - { node: 0, frac: 1}
-    #- { node: 1, frac: 0.5}
-  threads_per_node: 32
+    - { node: 0, frac: 0.5}
+    - { node: 1, frac: 0.5}
+  threads_per_node: 40
   max_threads: 0
   pin_threads: true
   numa_aware: true
@@ -31,10 +31,10 @@ devices:
       backend: cublas
       usestreams: true
       streams: 2
-    #- device_id: 1
-    #  backend: cublas
-    #  usestreams: true
-    #  streams: 2
+    - device_id: 1
+      backend: cublas
+      usestreams: true
+      streams: 2
 
 
 modes:

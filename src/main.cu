@@ -25,14 +25,15 @@ static inline double now_sec() {
 }
 
 
-
-
-
 static void print_config(const Config& cfg, const ModeCfg& mode) {
-    std::cout << "======Config======" << std::endl;
+    std::cout << "======CONFIG======" << std::endl;
     std::cout  << "name         " << cfg.name << std::endl;
     std::cout  << "seed         " << cfg.matrix.seed << std::endl;
-    std::cout  << "device_id    " << cfg.devices[0].device_id << std::endl;
+    std::cout  << "device_id    ";     
+    for (int i = 0 ; i < cfg.devices.size() ; i ++ ) {
+        std::cout << cfg.devices[i].device_id << "  ";
+    }
+    std::cout  << std::endl;
     std::cout  << "M            " << cfg.matrix.M << std::endl;
     std::cout  << "N            " << cfg.matrix.N << std::endl;
     std::cout  << "layout       " << cfg.matrix.layout << std::endl;
@@ -45,7 +46,7 @@ static void print_config(const Config& cfg, const ModeCfg& mode) {
     std::cout  << "repeats      " << cfg.benchmark.repeats << std::endl;
     std::cout  << "mode_idx     " << cfg.benchmark.mode_idx << std::endl;
     std::cout  << "double_buf   " << (cfg.benchmark.double_buffering ? "true" : "false") << std::endl;
-    
+    /*
     for (size_t i = 0 ; i < cfg.modes.size() ; i ++ ) {
         std::cout << " | input dtype = " << cfg.modes[i].input_dtype << std::endl;
         std::cout << " | math = " << cfg.modes[i].cublas_math_mode << std::endl;
@@ -53,7 +54,8 @@ static void print_config(const Config& cfg, const ModeCfg& mode) {
         std::cout << " | accumulate = " << cfg.modes[i].accumulate << std::endl;
         std::cout << std::endl;
     }
-    std::cout << "======end======\n\n";
+    */
+    std::cout << "======END CONFIG======\n\n";
 }
 
 
@@ -111,6 +113,24 @@ int main(int argc, char** argv) {
 
         // ---- Pre-allocate GPU buffers (outside timing) ----
         const size_t num_devices = cfg.devices.size();
+        if (num_devices == 0) throw std::runtime_error("cfg.devices is empty");
+        
+        int visible = 0;
+        cudaGetDeviceCount(&visible);
+    
+    
+        // validate YAML device ids exist at runtime
+        for (const auto& d : cfg.devices) {
+            if (d.device_id < 0 || d.device_id >= visible) {
+                throw std::runtime_error(
+                    "YAML device_id " + std::to_string(d.device_id) +
+                    " not visible at runtime (visible=" + std::to_string(visible) + ")"
+                );
+            }
+        }
+
+        cudaProfilerStart();
+
         std::vector<GpuBuffers> gpu_buffers(num_devices);
         for (size_t i = 0; i < num_devices; ++i) {
             gpu_buffers[i].allocate(
@@ -121,6 +141,8 @@ int main(int argc, char** argv) {
                 cfg.benchmark.double_buffering
             );
         }
+
+
 
         // ---- warmup ----
         for (int w = 0; w < cfg.benchmark.warmup_iters; ++w) {
@@ -135,7 +157,6 @@ int main(int argc, char** argv) {
         cudaDeviceSynchronize();
 
         // ---- profiler start (after warmup) ----
-        cudaProfilerStart();
 
         // ---- benchmark ----
         const int R = std::max(1, cfg.benchmark.repeats);
@@ -163,17 +184,17 @@ int main(int argc, char** argv) {
             const double wall_dt = t1 - t0;   // seconds
             times.push_back(wall_dt);
         
-            // ---- MAX across GPUs (parallel execution time) ----
+            // ---- total across GPUs (parallel execution time) ----
             double h2d_ms  = 0.0;
             double cast_ms = 0.0;
             double gemm_ms = 0.0;
             double total_elapsed_ms = 0.0;
 
             for (const auto& g : gpu_stats) {
-                h2d_ms  = std::max(h2d_ms,  (double)g.h2d_ms);
-                cast_ms = std::max(cast_ms, (double)g.cast_ms);
-                gemm_ms = std::max(gemm_ms, (double)g.gemm_ms);
-                total_elapsed_ms = std::max(total_elapsed_ms, (double)g.total_elapsed_ms);
+                h2d_ms  = std::max(h2d_ms, static_cast<double> (g.h2d_ms));
+                cast_ms = std::max(cast_ms, static_cast<double> (g.cast_ms));
+                gemm_ms = std::max(gemm_ms, static_cast<double> (g.gemm_ms));
+                total_elapsed_ms += static_cast<double> (g.total_elapsed_ms);
             }
 
             // convert ms -> seconds
@@ -186,13 +207,13 @@ int main(int argc, char** argv) {
             cast_times.push_back(cast_s);
             gemm_times.push_back(gemm_s);
 
+
             // Use actual elapsed (accounts for overlap) instead of sum
             gpu_times.push_back(elapsed_s);
         }
 
         // ---- profiler stop ----
         cudaDeviceSynchronize();
-        cudaProfilerStop();
 
         // ---- summary helpers ----
         auto stats = [](std::vector<double> v) {
@@ -217,7 +238,7 @@ int main(int argc, char** argv) {
         const double GFLOPS = FLOPS / 1e9;
         
         // ---- print summary ----
-        std::cout << "\n===== Summary =====\n";
+        std::cout << "\n===== SUMMARY BENCHMARK =====\n";
         std::cout << "repeats: " << times.size() << "\n\n";
         
         std::cout << "[Wall-clock total]\n";
@@ -231,31 +252,34 @@ int main(int argc, char** argv) {
         std::cout << "median : " << gpu_med  * 1e3 << " ms\n";
         std::cout << "mean   : " << gpu_mean * 1e3 << " ms\n";
         std::cout << "max    : " << gpu_max  * 1e3 << " ms\n";
-        std::cout << "approx GFLOP/s (min gpu time): " << (GFLOPS / gemm_min) << "\n";
-        std::cout << "approx GFLOP/s (median gpu)  : " << (GFLOPS / gemm_med) << "\n\n";
-        
+        std::cout << "approx kernel GFLOP/s (min gpu time of the slowest GPU): " << (GFLOPS / (2 * gemm_min)) << "\n";
+        std::cout << "approx kernel GFLOP/s (median gpu of the slowest GPU)  : " << (GFLOPS / (2 * gemm_med)) << "\n\n";
+        std::cout << "total-wall GFLOP/s (mean)    : " << (GFLOPS / t_mean)   << "\n\n";
+
         std::cout << "[GPU breakdown]\n";
         std::cout << "H2D   mean: " << h2d_mean  * 1e3 << " ms (median " << h2d_med  * 1e3 << ")\n";
         std::cout << "CAST  mean: " << cast_mean * 1e3 << " ms (median " << cast_med * 1e3 << ")\n";
         std::cout << "GEMM  mean: " << gemm_mean * 1e3 << " ms (median " << gemm_med * 1e3 << ")\n";
         
-        std::cout << "===================\n\n";
+        std::cout << "==========END=========\n\n";
 
-        // ---- Free GPU buffers (outside timing) ----
+
+        // ---- Free GPU buffers ----
         for (auto& buf : gpu_buffers) {
             buf.free();
         }
 
         /*
        // 6) Save result for further calculations
-       if (!save_npy_fp32(out_path, C.data(), cfg.matrix.N)) {
+       if (!save_npy_fp32(out_path, C, cfg.matrix.N)) {
            std::cerr << "[warn] failed to save npy to: " << out_path << "\n";
        }
        else {
            std::cout << "Saved C to: " << out_path << "\n";
        }
-        */
-
+        */    
+        cudaProfilerStop();
+    
         return 0;
     }
     catch (const std::exception& e) {
