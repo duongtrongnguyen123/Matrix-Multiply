@@ -8,6 +8,11 @@
 ####################################
 *.sh
 
+# Nsight Systems profiler outputs
+*.nsys-rep
+*.sqlite
+*.sqlite-journal
+
 ####################################
 # Executables / binaries
 ####################################

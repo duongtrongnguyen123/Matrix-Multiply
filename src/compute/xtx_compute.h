@@ -6,6 +6,7 @@
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
 #include <cuda_bf16.h>
+#include <cublas_v2.h>
 #include <config/xtx_config.h>
 #include <generate/xtx_generate.h>
 
@@ -42,8 +43,27 @@ struct GpuBuffers {
     size_t max_chunk_elems = 0;
     bool is_double_buffering = false;
 
+    // ---- Pre-allocated CUDA resources (to avoid malloc/free in hot path) ----
+    // Streams
+    cudaStream_t stream_h2d = nullptr;      // H2D transfer stream
+    cudaStream_t stream_compute = nullptr;  // Compute stream (also used as single stream)
+
+    // cuBLAS handle
+    cublasHandle_t cublas_handle = nullptr;
+
+    // Timing events (pre-allocated for max_chunks)
+    int allocated_max_chunks = 0;
+    std::vector<cudaEvent_t> gemm_start, gemm_stop;
+    std::vector<cudaEvent_t> h2d_start, h2d_stop;
+    std::vector<cudaEvent_t> cast_start, cast_stop;
+    cudaEvent_t h2d_done = nullptr;
+    cudaEvent_t compute_done = nullptr;
+    cudaEvent_t overall_start = nullptr;
+    cudaEvent_t overall_stop = nullptr;
+
     // Allocate all buffers based on config
-    void allocate(int dev_id, int64_t N, int64_t rows_per_chunk,
+    // M_total is needed to calculate max_chunks for event allocation
+    void allocate(int dev_id, int64_t N, int64_t M_total, int64_t rows_per_chunk,
                   const std::string& dtype, bool double_buffering);
 
     // Free all buffers

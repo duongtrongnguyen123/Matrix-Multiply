@@ -23,7 +23,7 @@
 
 // ========== GpuBuffers implementation ==========
 
-void GpuBuffers::allocate(int dev_id, int64_t N, int64_t rows_per_chunk,
+void GpuBuffers::allocate(int dev_id, int64_t N, int64_t M_total, int64_t rows_per_chunk,
                           const std::string& dtype, bool double_buffering) {
     device_id = dev_id;
     is_double_buffering = double_buffering;
@@ -59,6 +59,40 @@ void GpuBuffers::allocate(int dev_id, int64_t N, int64_t rows_per_chunk,
             cuda_check(cudaMalloc(reinterpret_cast<void**>(&dXb_pong), max_chunk_elems * sizeof(__nv_bfloat16)), "cudaMalloc dXb_pong");
         }
     }
+
+    // ---- Create CUDA streams ----
+    cuda_check(cudaStreamCreateWithFlags(&stream_h2d, cudaStreamNonBlocking), "cudaStreamCreate stream_h2d");
+    cuda_check(cudaStreamCreateWithFlags(&stream_compute, cudaStreamNonBlocking), "cudaStreamCreate stream_compute");
+
+    // ---- Create cuBLAS handle ----
+    cublas_check(cublasCreate(&cublas_handle), "cublasCreate");
+    cublas_check(cublasSetStream(cublas_handle, stream_compute), "cublasSetStream");
+
+    // ---- Create timing events ----
+    // Calculate max_chunks based on M_total (worst case: all rows on this GPU)
+    allocated_max_chunks = static_cast<int>((M_total + rows_per_chunk - 1) / rows_per_chunk);
+
+    gemm_start.resize(allocated_max_chunks);
+    gemm_stop.resize(allocated_max_chunks);
+    h2d_start.resize(allocated_max_chunks);
+    h2d_stop.resize(allocated_max_chunks);
+    cast_start.resize(allocated_max_chunks);
+    cast_stop.resize(allocated_max_chunks);
+
+    for (int i = 0; i < allocated_max_chunks; ++i) {
+        cuda_check(cudaEventCreate(&gemm_start[i]), "cudaEventCreate gemm_start");
+        cuda_check(cudaEventCreate(&gemm_stop[i]), "cudaEventCreate gemm_stop");
+        cuda_check(cudaEventCreate(&h2d_start[i]), "cudaEventCreate h2d_start");
+        cuda_check(cudaEventCreate(&h2d_stop[i]), "cudaEventCreate h2d_stop");
+        cuda_check(cudaEventCreate(&cast_start[i]), "cudaEventCreate cast_start");
+        cuda_check(cudaEventCreate(&cast_stop[i]), "cudaEventCreate cast_stop");
+    }
+
+    // Sync events for double buffering
+    cuda_check(cudaEventCreate(&h2d_done), "cudaEventCreate h2d_done");
+    cuda_check(cudaEventCreate(&compute_done), "cudaEventCreate compute_done");
+    cuda_check(cudaEventCreate(&overall_start), "cudaEventCreate overall_start");
+    cuda_check(cudaEventCreate(&overall_stop), "cudaEventCreate overall_stop");
 }
 
 void GpuBuffers::free() {
@@ -66,6 +100,32 @@ void GpuBuffers::free() {
 
     cuda_check(cudaSetDevice(device_id), "cudaSetDevice in GpuBuffers::free");
 
+    // Destroy timing events
+    for (int i = 0; i < allocated_max_chunks; ++i) {
+        if (gemm_start[i]) cudaEventDestroy(gemm_start[i]);
+        if (gemm_stop[i]) cudaEventDestroy(gemm_stop[i]);
+        if (h2d_start[i]) cudaEventDestroy(h2d_start[i]);
+        if (h2d_stop[i]) cudaEventDestroy(h2d_stop[i]);
+        if (cast_start[i]) cudaEventDestroy(cast_start[i]);
+        if (cast_stop[i]) cudaEventDestroy(cast_stop[i]);
+    }
+    gemm_start.clear(); gemm_stop.clear();
+    h2d_start.clear(); h2d_stop.clear();
+    cast_start.clear(); cast_stop.clear();
+
+    if (h2d_done) { cudaEventDestroy(h2d_done); h2d_done = nullptr; }
+    if (compute_done) { cudaEventDestroy(compute_done); compute_done = nullptr; }
+    if (overall_start) { cudaEventDestroy(overall_start); overall_start = nullptr; }
+    if (overall_stop) { cudaEventDestroy(overall_stop); overall_stop = nullptr; }
+
+    // Destroy cuBLAS handle
+    if (cublas_handle) { cublasDestroy(cublas_handle); cublas_handle = nullptr; }
+
+    // Destroy streams
+    if (stream_h2d) { cudaStreamDestroy(stream_h2d); stream_h2d = nullptr; }
+    if (stream_compute) { cudaStreamDestroy(stream_compute); stream_compute = nullptr; }
+
+    // Free device memory
     if (dXb_pong) { cudaFree(dXb_pong); dXb_pong = nullptr; }
     if (dXb_ping) { cudaFree(dXb_ping); dXb_ping = nullptr; }
     if (dXh_pong) { cudaFree(dXh_pong); dXh_pong = nullptr; }
@@ -75,6 +135,7 @@ void GpuBuffers::free() {
     if (dC)       { cudaFree(dC);       dC = nullptr; }
 
     device_id = -1;
+    allocated_max_chunks = 0;
 }
 
 void GpuBuffers::reset_output(cudaStream_t stream) {
@@ -123,15 +184,12 @@ void compute_xtx_double_buffering (
 
     cuda_check(cudaSetDevice(device_id), "cudaSetDevice");
 
-    // Two streams: one for H2D transfers, one for compute
-    cudaStream_t stream_h2d, stream_compute;
-    cuda_check(cudaStreamCreateWithFlags(&stream_h2d, cudaStreamNonBlocking), "cudaStreamCreate h2d");
-    cuda_check(cudaStreamCreateWithFlags(&stream_compute, cudaStreamNonBlocking), "cudaStreamCreate compute");
+    // Use pre-allocated streams and handle
+    cudaStream_t stream_h2d = bufs.stream_h2d;
+    cudaStream_t stream_compute = bufs.stream_compute;
+    cublasHandle_t handle = bufs.cublas_handle;
 
-    cublasHandle_t handle;
-    cublas_check(cublasCreate(&handle), "cublasCreate handle");
-    cublas_check(cublasSetStream(handle, stream_compute), "cublasSetStream");
-
+    // Set math mode (needs to be done each call as mode might change)
     cublasMath_t math_mode = parse_math_mode(mode.cublas_math_mode);
     cublas_check(cublasSetMathMode(handle, math_mode), "cublasSetMathMode");
 
@@ -164,28 +222,19 @@ void compute_xtx_double_buffering (
     int max_chunks = (rows_local + rows_per_chunk - 1) / rows_per_chunk +
                      (rows_remote + rows_per_chunk - 1) / rows_per_chunk;
 
-    std::vector<cudaEvent_t> gemm_start(max_chunks), gemm_stop(max_chunks);
-    std::vector<cudaEvent_t> h2d_start(max_chunks), h2d_stop(max_chunks);
-    std::vector<cudaEvent_t> cast_start(max_chunks), cast_stop(max_chunks);
+    // Use pre-allocated events (reference to bufs vectors)
+    std::vector<cudaEvent_t>& gemm_start = bufs.gemm_start;
+    std::vector<cudaEvent_t>& gemm_stop = bufs.gemm_stop;
+    std::vector<cudaEvent_t>& h2d_start = bufs.h2d_start;
+    std::vector<cudaEvent_t>& h2d_stop = bufs.h2d_stop;
+    std::vector<cudaEvent_t>& cast_start = bufs.cast_start;
+    std::vector<cudaEvent_t>& cast_stop = bufs.cast_stop;
 
-    for (int i = 0; i < max_chunks; ++i) {
-        cudaEventCreate(&gemm_start[i]);
-        cudaEventCreate(&gemm_stop[i]);
-        cudaEventCreate(&h2d_start[i]);
-        cudaEventCreate(&h2d_stop[i]);
-        cudaEventCreate(&cast_start[i]);
-        cudaEventCreate(&cast_stop[i]);
-    }
-
-    // Events for synchronization between streams
-    cudaEvent_t h2d_done, compute_done;
-    cudaEventCreate(&h2d_done);
-    cudaEventCreate(&compute_done);
-
-    // Overall timing events (to measure actual elapsed, not sum of overlapping)
-    cudaEvent_t overall_start, overall_stop;
-    cudaEventCreate(&overall_start);
-    cudaEventCreate(&overall_stop);
+    // Use pre-allocated sync events
+    cudaEvent_t h2d_done = bufs.h2d_done;
+    cudaEvent_t compute_done = bufs.compute_done;
+    cudaEvent_t overall_start = bufs.overall_start;
+    cudaEvent_t overall_stop = bufs.overall_stop;
 
     int chunk_id = 0;
     bool use_ping = true;
@@ -212,13 +261,8 @@ void compute_xtx_double_buffering (
     if (X_remote && rows_remote > 0) add_chunks(X_remote, rows_remote, false);
 
     if (chunks.empty()) {
-        // Nothing to process, cleanup streams/handles and return
-        // Note: buffers are pre-allocated, don't free them here
-        cudaEventDestroy(h2d_done);
-        cudaEventDestroy(compute_done);
-        cublasDestroy(handle);
-        cudaStreamDestroy(stream_h2d);
-        cudaStreamDestroy(stream_compute);
+        // Nothing to process, just return
+        // All resources are pre-allocated and will be freed by GpuBuffers::free()
         return;
     }
 
@@ -391,29 +435,16 @@ void compute_xtx_double_buffering (
     time.h2d_ms  = h2d_ms_total;
     time.cast_ms = cast_ms_total;
 
+    // DEBUG: Print timing values
+    printf("[DEBUG double_buf] chunks=%d h2d=%.2f cast=%.2f gemm=%.2f ms\n",
+           chunk_id, h2d_ms_total, cast_ms_total, gemm_ms_total);
+
     // Measure actual elapsed time (accounts for H2D/GEMM overlap)
     float overall_elapsed = 0.f;
     cudaEventElapsedTime(&overall_elapsed, overall_start, overall_stop);
     time.total_elapsed_ms = overall_elapsed;
 
-    // Cleanup events
-    for (int i = 0; i < max_chunks; ++i) {
-        cudaEventDestroy(gemm_start[i]);
-        cudaEventDestroy(gemm_stop[i]);
-        cudaEventDestroy(h2d_start[i]);
-        cudaEventDestroy(h2d_stop[i]);
-        cudaEventDestroy(cast_start[i]);
-        cudaEventDestroy(cast_stop[i]);
-    }
-    cudaEventDestroy(h2d_done);
-    cudaEventDestroy(compute_done);
-    cudaEventDestroy(overall_start);
-    cudaEventDestroy(overall_stop);
-
-    // Cleanup handles and streams only (buffers are pre-allocated, freed externally)
-    cublasDestroy(handle);
-    cudaStreamDestroy(stream_h2d);
-    cudaStreamDestroy(stream_compute);
+    // No cleanup needed - all resources are pre-allocated and will be freed by GpuBuffers::free()
 }
 
 static void compute_xtx_single_device(
@@ -434,13 +465,11 @@ static void compute_xtx_single_device(
 
     cuda_check(cudaSetDevice(device_id), "CudaSetDevice");
 
-    cudaStream_t stream;
-    cuda_check(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking), "cudaStreamCreate");
+    // Use pre-allocated stream (use stream_compute as main stream for single buffering)
+    cudaStream_t stream = bufs.stream_compute;
+    cublasHandle_t handle = bufs.cublas_handle;
 
-    cublasHandle_t handle;
-    cublas_check(cublasCreate(&handle), "cublasCreate");
-    cublas_check(cublasSetStream(handle, stream), "cublasSetStream");
-
+    // Set math mode (needs to be done each call as mode might change)
     cublasMath_t math_mode = parse_math_mode(mode.cublas_math_mode);
     cublas_check(cublasSetMathMode(handle, math_mode), "cublasSetMathMode");
 
@@ -465,25 +494,20 @@ static void compute_xtx_single_device(
     const bool want_bf16 = (dtype == "bf16");
     const bool want_tf32 = (dtype == "tf32");
     const bool want_fp32 = (!want_fp16 && !want_bf16 && !want_tf32);
-    
+
     // timer to time H2D time, compute time, casting time
     const cublasFillMode_t uplo = parse_triangle(mode.triangle);
 
     int max_chunks = (rows_local + rows_per_chunk - 1) / rows_per_chunk +
                      (rows_remote + rows_per_chunk - 1) / rows_per_chunk;
 
-    std::vector<cudaEvent_t> gemm_start(max_chunks, 0), gemm_stop(max_chunks, 0);
-    std::vector<cudaEvent_t> h2d_start(max_chunks, 0), h2d_stop(max_chunks, 0);
-    std::vector<cudaEvent_t> cast_start(max_chunks, 0), cast_stop(max_chunks, 0);
-
-    for (int i = 0; i < max_chunks; ++i) {
-        cudaEventCreate(&gemm_start[i]);
-        cudaEventCreate(&gemm_stop[i]);
-        cudaEventCreate(&h2d_start[i]);
-        cudaEventCreate(&h2d_stop[i]);
-        cudaEventCreate(&cast_start[i]);
-        cudaEventCreate(&cast_stop[i]);
-    }
+    // Use pre-allocated events (reference to bufs vectors)
+    std::vector<cudaEvent_t>& gemm_start = bufs.gemm_start;
+    std::vector<cudaEvent_t>& gemm_stop = bufs.gemm_stop;
+    std::vector<cudaEvent_t>& h2d_start = bufs.h2d_start;
+    std::vector<cudaEvent_t>& h2d_stop = bufs.h2d_stop;
+    std::vector<cudaEvent_t>& cast_start = bufs.cast_start;
+    std::vector<cudaEvent_t>& cast_stop = bufs.cast_stop;
 
     int chunk_id = 0;
 
@@ -661,9 +685,11 @@ static void compute_xtx_single_device(
     // No overlap in single buffering, so total = sum of components
     time.total_elapsed_ms = h2d_ms_total + cast_ms_total + gemm_ms_total;
 
-    // Cleanup handles and streams only (buffers are pre-allocated, freed externally)
-    cublasDestroy(handle);
-    cudaStreamDestroy(stream);
+    // DEBUG: Print timing values
+    printf("[DEBUG single_buf] chunks=%d h2d=%.2f cast=%.2f gemm=%.2f ms\n",
+           chunk_id, h2d_ms_total, cast_ms_total, gemm_ms_total);
+
+    // No cleanup needed - all resources are pre-allocated and will be freed by GpuBuffers::free()
 }
 
 

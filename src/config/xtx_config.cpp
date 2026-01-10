@@ -21,7 +21,8 @@ Config load_config_yaml(const std::string& path) {
     HostMemoryCfg host_memory{};
     std::vector<DeviceCfg> devices;
     std::vector<ModeCfg> modes; // compute-only
-    ComputeScalars compute_scalars{}; 
+    ComputeScalars compute_scalars{};
+    OutputCfg output{}; 
 
     if (root["experiment"]) {
         auto e = root["experiment"];
@@ -123,6 +124,12 @@ Config load_config_yaml(const std::string& path) {
         compute_scalars.beta_first = x["beta_first"].as<float>();
         compute_scalars.beta_rest  = x["beta_rest"].as<float>();
     }
+
+    if (root["output"]) {
+        auto o = root["output"];
+        if (o["save_result"]) output.save_result = o["save_result"].as<bool>();
+        if (o["output_dir"])  output.output_dir  = o["output_dir"].as<std::string>();
+    }
     
     if (matrix.M <= 0 || matrix.N <= 0) throw std::runtime_error("Invalid matrix size!");
     if (matrix.layout != "row_major") {
@@ -138,5 +145,6 @@ Config load_config_yaml(const std::string& path) {
     cfg.modes = std::move(modes);
 
     cfg.compute_scalars = compute_scalars;
+    cfg.output = output;
     return cfg;
 }

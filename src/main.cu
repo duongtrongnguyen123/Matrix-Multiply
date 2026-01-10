@@ -25,14 +25,15 @@ static inline double now_sec() {
 }
 
 
-
-
-
 static void print_config(const Config& cfg, const ModeCfg& mode) {
-    std::cout << "======Config======" << std::endl;
+    std::cout  << "======Config======" << std::endl;
     std::cout  << "name         " << cfg.name << std::endl;
     std::cout  << "seed         " << cfg.matrix.seed << std::endl;
-    std::cout  << "device_id    " << cfg.devices[0].device_id << std::endl;
+    std::cout  << "device_id    ";
+    for (int i = 0 ; i  <cfg.devices.size() ; i ++ ) {
+            std::cout << cfg.devices[i].device_id << " ";
+    }
+    std::cout  << std::endl;
     std::cout  << "M            " << cfg.matrix.M << std::endl;
     std::cout  << "N            " << cfg.matrix.N << std::endl;
     std::cout  << "layout       " << cfg.matrix.layout << std::endl;
@@ -45,7 +46,7 @@ static void print_config(const Config& cfg, const ModeCfg& mode) {
     std::cout  << "repeats      " << cfg.benchmark.repeats << std::endl;
     std::cout  << "mode_idx     " << cfg.benchmark.mode_idx << std::endl;
     std::cout  << "double_buf   " << (cfg.benchmark.double_buffering ? "true" : "false") << std::endl;
-    
+    /* 
     for (size_t i = 0 ; i < cfg.modes.size() ; i ++ ) {
         std::cout << " | input dtype = " << cfg.modes[i].input_dtype << std::endl;
         std::cout << " | math = " << cfg.modes[i].cublas_math_mode << std::endl;
@@ -53,6 +54,7 @@ static void print_config(const Config& cfg, const ModeCfg& mode) {
         std::cout << " | accumulate = " << cfg.modes[i].accumulate << std::endl;
         std::cout << std::endl;
     }
+    */
     std::cout << "======end======\n\n";
 }
 
@@ -61,12 +63,12 @@ static void print_config(const Config& cfg, const ModeCfg& mode) {
 int main(int argc, char** argv) {
     if (argc < 2) {
         std::cerr << "Usage:\n"
-                  << "  " << argv[0] << " config.yaml [out.npy]\n";
+                  << "  " << argv[0] << " config.yaml\n";
         return 1;
     }
 
     std::string cfg_path = argv[1];
-    // std::string out_path = (argc >= 3) ? argv[2] : " ";
+
     try {
         Config cfg = load_config_yaml(cfg_path);
         size_t mode_idx = cfg.benchmark.mode_idx;
@@ -116,11 +118,14 @@ int main(int argc, char** argv) {
             gpu_buffers[i].allocate(
                 cfg.devices[i].device_id,
                 cfg.matrix.N,
+                cfg.matrix.M,  // M_total for event allocation
                 cfg.chunking.rows_per_chunk,
                 mode.name,
                 cfg.benchmark.double_buffering
             );
         }
+        
+        cudaProfilerStart();
 
         // ---- warmup ----
         for (int w = 0; w < cfg.benchmark.warmup_iters; ++w) {
@@ -134,16 +139,14 @@ int main(int argc, char** argv) {
         }
         cudaDeviceSynchronize();
 
-        // ---- profiler start (after warmup) ----
-        cudaProfilerStart();
 
         // ---- benchmark ----
         const int R = std::max(1, cfg.benchmark.repeats);
         
-        std::vector<double> times;      // wall-clock seconds
+        std::vector<double> times;      // wall-clock times
         times.reserve(R);
         
-        std::vector<double> gpu_times;  // summed GPU total seconds
+        std::vector<double> gpu_times;  // max GPU's times
         gpu_times.reserve(R);
         
         std::vector<double> h2d_times, cast_times, gemm_times;
@@ -169,7 +172,8 @@ int main(int argc, char** argv) {
             double gemm_ms = 0.0;
             double total_elapsed_ms = 0.0;
 
-            for (const auto& g : gpu_stats) {
+            for (size_t gi = 0 ; gi < gpu_stats.size() ; gi ++ ) {
+                const auto& g = gpu_stats[gi];
                 h2d_ms  = std::max(h2d_ms,  (double)g.h2d_ms);
                 cast_ms = std::max(cast_ms, (double)g.cast_ms);
                 gemm_ms = std::max(gemm_ms, (double)g.gemm_ms);
@@ -186,13 +190,14 @@ int main(int argc, char** argv) {
             cast_times.push_back(cast_s);
             gemm_times.push_back(gemm_s);
 
+
             // Use actual elapsed (accounts for overlap) instead of sum
             gpu_times.push_back(elapsed_s);
         }
 
         // ---- profiler stop ----
         cudaDeviceSynchronize();
-        cudaProfilerStop();
+
 
         // ---- summary helpers ----
         auto stats = [](std::vector<double> v) {
@@ -231,30 +236,43 @@ int main(int argc, char** argv) {
         std::cout << "median : " << gpu_med  * 1e3 << " ms\n";
         std::cout << "mean   : " << gpu_mean * 1e3 << " ms\n";
         std::cout << "max    : " << gpu_max  * 1e3 << " ms\n";
-        std::cout << "approx GFLOP/s (min gpu time): " << (GFLOPS / gemm_min) << "\n";
-        std::cout << "approx GFLOP/s (median gpu)  : " << (GFLOPS / gemm_med) << "\n\n";
-        
+        std::cout << "approx GFLOP/s (min gpu time on slowest gpu): " << (GFLOPS / (num_devices * gemm_min)) << "\n";
+        std::cout << "approx GFLOP/s (median gpu on slowest gpu)  : " << (GFLOPS / (num_devices * gemm_med)) << "\n";
+        std::cout << "approx wall-total GFLOP/s                   : " << (GFLOPS / t_mean)                   << "\n\n";
+
         std::cout << "[GPU breakdown]\n";
         std::cout << "H2D   mean: " << h2d_mean  * 1e3 << " ms (median " << h2d_med  * 1e3 << ")\n";
         std::cout << "CAST  mean: " << cast_mean * 1e3 << " ms (median " << cast_med * 1e3 << ")\n";
         std::cout << "GEMM  mean: " << gemm_mean * 1e3 << " ms (median " << gemm_med * 1e3 << ")\n";
         
-        std::cout << "===================\n\n";
+        std::cout << "===================\n\n" << std::flush;
+
 
         // ---- Free GPU buffers (outside timing) ----
         for (auto& buf : gpu_buffers) {
             buf.free();
         }
+        
 
-        /*
-       // 6) Save result for further calculations
-       if (!save_npy_fp32(out_path, C.data(), cfg.matrix.N)) {
-           std::cerr << "[warn] failed to save npy to: " << out_path << "\n";
-       }
-       else {
-           std::cout << "Saved C to: " << out_path << "\n";
-       }
-        */
+        // 6) Save result as binary with dtype in filename (if enabled)
+        if (cfg.output.save_result) {
+            std::string out_path = cfg.output.output_dir + "/C_"
+                + std::to_string(cfg.matrix.N) + "x" + std::to_string(cfg.matrix.N)
+                + "_" + mode.name + ".bin";
+
+            std::ofstream ofs(out_path, std::ios::binary);
+            if (!ofs) {
+                std::cerr << "[warn] failed to open for writing: " << out_path << "\n";
+            } else {
+                // Write header: N (int64), then raw float data
+                int64_t N = cfg.matrix.N;
+                ofs.write(reinterpret_cast<const char*>(&N), sizeof(N));
+                ofs.write(reinterpret_cast<const char*>(C), C_bytes);
+                ofs.close();
+                std::cout << "Saved C to: " << out_path << " (" << (C_bytes + sizeof(N)) << " bytes)\n";
+            }
+        }
+        cudaProfilerStop();
 
         return 0;
     }

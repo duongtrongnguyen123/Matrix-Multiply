@@ -63,6 +63,11 @@ struct ComputeScalars {
     float beta_rest  = 1.0f;
 };
 
+struct OutputCfg {
+    bool save_result = false;
+    std::string output_dir = ".";
+};
+
 struct Config {
     std::string name;
 
@@ -73,7 +78,8 @@ struct Config {
     HostMemoryCfg host_memory;    //numa nodes
     std::vector<DeviceCfg> devices;
     std::vector<ModeCfg> modes; // compute-only
-    ComputeScalars compute_scalars; 
+    ComputeScalars compute_scalars;
+    OutputCfg output;
 };
 
 Config load_config_yaml(const std::string& path);
