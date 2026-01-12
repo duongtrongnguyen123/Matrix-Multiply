@@ -35,6 +35,9 @@ void GpuBuffers::allocate(int dev_id, int64_t N, int64_t M_total, int64_t rows_p
     bytes_C = static_cast<size_t>(N) * static_cast<size_t>(N) * sizeof(float);
     cuda_check(cudaMalloc(reinterpret_cast<void**>(&dC), bytes_C), "cudaMalloc dC");
 
+    // Allocate pinned host buffer for parallel D2H reduction
+    cuda_check(cudaMallocHost(reinterpret_cast<void**>(&h_C_partial), bytes_C), "cudaMallocHost h_C_partial");
+
     // Allocate input buffers
     cuda_check(cudaMalloc(reinterpret_cast<void**>(&dX_ping), max_chunk_elems * sizeof(float)), "cudaMalloc dX_ping");
 
@@ -133,6 +136,9 @@ void GpuBuffers::free() {
     if (dX_pong)  { cudaFree(dX_pong);  dX_pong = nullptr; }
     if (dX_ping)  { cudaFree(dX_ping);  dX_ping = nullptr; }
     if (dC)       { cudaFree(dC);       dC = nullptr; }
+
+    // Free pinned host buffer
+    if (h_C_partial) { cudaFreeHost(h_C_partial); h_C_partial = nullptr; }
 
     device_id = -1;
     allocated_max_chunks = 0;
@@ -749,7 +755,7 @@ std::vector<GpuTimeTotal> compute_xtx_multi_device(
                 src0->ptr, src0->rows,
                 src1 ? src1->ptr : nullptr,
                 src1 ? src1->rows : 0,
-                C_out_row_major, false,
+                C_out_row_major, true,  // copy_back = true for single GPU
                 gpu_buffers[0],
                 times[0]);
         } else {
@@ -758,7 +764,7 @@ std::vector<GpuTimeTotal> compute_xtx_multi_device(
                 src0->ptr, src0->rows,
                 src1 ? src1->ptr : nullptr,
                 src1 ? src1->rows : 0,
-                C_out_row_major, false,
+                C_out_row_major, true,  // copy_back = true for single GPU
                 gpu_buffers[0],
                 times[0]);
         }
@@ -810,8 +816,37 @@ std::vector<GpuTimeTotal> compute_xtx_multi_device(
 
     for (auto& t : gpu_threads) t.join();
 
-    // TODO: Multi-GPU reduction not yet implemented
-    // Each GPU currently writes to C_out_row_major directly (accumulates in-place)
+    // ---- Parallel D2H transfers ----
+    // Each GPU copies its dC to its pinned h_C_partial buffer
+    for (int i = 0; i < used; ++i) {
+        cuda_check(cudaSetDevice(params.devices[i].device_id), "cudaSetDevice for D2H");
+        cuda_check(cudaMemcpyAsync(
+            gpu_buffers[i].h_C_partial,
+            gpu_buffers[i].dC,
+            gpu_buffers[i].bytes_C,
+            cudaMemcpyDeviceToHost,
+            gpu_buffers[i].stream_compute
+        ), "D2H partial result");
+    }
+
+    // Sync all D2H transfers
+    for (int i = 0; i < used; ++i) {
+        cuda_check(cudaSetDevice(params.devices[i].device_id), "cudaSetDevice for sync");
+        cuda_check(cudaStreamSynchronize(gpu_buffers[i].stream_compute), "sync D2H");
+    }
+
+    // ---- CPU reduction with OpenMP + SIMD ----
+    const size_t C_elems = gpu_buffers[0].bytes_C / sizeof(float);
+
+    #pragma omp parallel for simd schedule(static)
+    for (size_t i = 0; i < C_elems; ++i) {
+        float sum = 0.0f;
+        for (int g = 0; g < used; ++g) {
+            sum += gpu_buffers[g].h_C_partial[i];
+        }
+        C_out_row_major[i] = sum;
+    }
+
     return times;
 }
 

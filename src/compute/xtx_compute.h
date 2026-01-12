@@ -28,6 +28,9 @@ struct GpuBuffers {
     float* dC = nullptr;
     size_t bytes_C = 0;
 
+    // Pinned host buffer for parallel D2H reduction
+    float* h_C_partial = nullptr;
+
     // Input buffers (for double buffering: ping/pong, for single: just one)
     float* dX_ping = nullptr;
     float* dX_pong = nullptr;  // nullptr if single buffering

@@ -89,7 +89,9 @@ metrics:
     reference_mode: fp32
     error_norm: frobenius
 
-output: 
+output:
+    save_result: false        # save C matrix as binary
+    output_dir: "./output"    # directory for C_NxN_dtype.bin
     result_csv: result.csv
     log_level: info
 
