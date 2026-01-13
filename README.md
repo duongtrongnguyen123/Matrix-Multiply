@@ -34,6 +34,23 @@ nvcc -std=c++17 -O3 -Xcompiler -fopenmp -I./src \
   -o xtx_bench
 ```
 
+## Docker
+
+Build the container:
+```bash
+docker build -t xtx-bench .
+```
+
+Run (requires NVIDIA GPU and [nvidia-container-toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/install-guide.html)):
+```bash
+docker run --gpus all xtx-bench
+```
+
+Run with custom config:
+```bash
+docker run --gpus all -v $(pwd)/configs:/app/configs xtx-bench ./xtx_bench configs/your_config.yaml
+```
+
 ## Usage
 
 ```bash
