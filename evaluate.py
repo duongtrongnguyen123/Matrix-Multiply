@@ -79,24 +79,55 @@ def print_metrics(metrics: dict):
 
 def print_summary_table(all_metrics: list):
     """Print a summary comparison table."""
-    print(f"\n{'=' * 70}")
-    print("  Summary Comparison Table")
-    print(f"{'=' * 70}")
-    print(f"{'Metric':<25} {'bf16':>20} {'tf32':>20}")
-    print(f"{'-' * 70}")
+    dtypes = ['fp32', 'tf32', 'bf16', 'fp16']
+    metrics_dict = {m['name'].lower(): m for m in all_metrics}
 
-    bf16 = next((m for m in all_metrics if 'bf16' in m['name'].lower()), None)
-    tf32 = next((m for m in all_metrics if 'tf32' in m['name'].lower()), None)
+    print(f"\n{'=' * 95}")
+    print("  Summary Comparison Table (vs fp64 reference)")
+    print(f"{'=' * 95}")
+    print(f"{'Metric':<20} {'fp32':>17} {'tf32':>17} {'bf16':>17} {'fp16':>17}")
+    print(f"{'-' * 95}")
 
-    if bf16 and tf32:
-        print(f"{'Max abs error':<25} {bf16['max_abs_err']:>20.6e} {tf32['max_abs_err']:>20.6e}")
-        print(f"{'Mean abs error':<25} {bf16['mean_abs_err']:>20.6e} {tf32['mean_abs_err']:>20.6e}")
-        print(f"{'RMSE':<25} {bf16['rmse']:>20.6e} {tf32['rmse']:>20.6e}")
-        print(f"{'Max rel error':<25} {bf16['max_rel_err']:>20.6e} {tf32['max_rel_err']:>20.6e}")
-        print(f"{'Mean rel error':<25} {bf16['mean_rel_err']:>20.6e} {tf32['mean_rel_err']:>20.6e}")
-        print(f"{'Frobenius ratio':<25} {bf16['fro_ratio']:>20.6e} {tf32['fro_ratio']:>20.6e}")
-        print(f"{'Exact match %':<25} {bf16['exact_pct']:>19.2f}% {tf32['exact_pct']:>19.2f}%")
-    print(f"{'=' * 70}")
+    def get_val(dtype, key):
+        return metrics_dict.get(dtype, {}).get(key, float('nan'))
+
+    print(f"{'Max abs error':<20}", end='')
+    for d in dtypes:
+        print(f" {get_val(d, 'max_abs_err'):>16.6e}", end='')
+    print()
+
+    print(f"{'Mean abs error':<20}", end='')
+    for d in dtypes:
+        print(f" {get_val(d, 'mean_abs_err'):>16.6e}", end='')
+    print()
+
+    print(f"{'RMSE':<20}", end='')
+    for d in dtypes:
+        print(f" {get_val(d, 'rmse'):>16.6e}", end='')
+    print()
+
+    print(f"{'Max rel error':<20}", end='')
+    for d in dtypes:
+        print(f" {get_val(d, 'max_rel_err'):>16.6e}", end='')
+    print()
+
+    print(f"{'Mean rel error':<20}", end='')
+    for d in dtypes:
+        print(f" {get_val(d, 'mean_rel_err'):>16.6e}", end='')
+    print()
+
+    print(f"{'Frobenius ratio':<20}", end='')
+    for d in dtypes:
+        print(f" {get_val(d, 'fro_ratio'):>16.6e}", end='')
+    print()
+
+    print(f"{'Exact match %':<20}", end='')
+    for d in dtypes:
+        val = get_val(d, 'exact_pct')
+        print(f" {val:>15.2f}%", end='')
+    print()
+
+    print(f"{'=' * 95}")
 
 
 def main():
@@ -120,14 +151,14 @@ def main():
         size_mb = f.stat().st_size / (1024 * 1024)
         print(f"  - {f.name} ({size_mb:.1f} MB)")
 
-    # Load reference (fp32)
-    fp32_file = output_dir / next((f.name for f in bin_files if 'fp32' in f.name.lower()), None)
-    if not fp32_file or not fp32_file.exists():
-        print("Error: fp32 reference file not found")
+    # Load reference (fp64)
+    fp64_file = output_dir / next((f.name for f in bin_files if 'fp64' in f.name.lower()), None)
+    if not fp64_file or not fp64_file.exists():
+        print("Error: fp64 reference file not found")
         sys.exit(1)
 
-    print(f"\nLoading reference: {fp32_file.name}...")
-    ref_matrix = load_matrix_bin(fp32_file)
+    print(f"\nLoading reference: {fp64_file.name}...")
+    ref_matrix = load_matrix_bin(fp64_file)
     print(f"  Shape: {ref_matrix.shape}")
     print(f"  Range: [{ref_matrix.min():.6e}, {ref_matrix.max():.6e}]")
     print(f"  Mean:  {ref_matrix.mean():.6e}")
@@ -135,7 +166,7 @@ def main():
     # Evaluate other dtypes
     all_metrics = []
     for bin_file in bin_files:
-        if 'fp32' in bin_file.name.lower():
+        if 'fp64' in bin_file.name.lower():
             continue
 
         # Extract dtype name from filename

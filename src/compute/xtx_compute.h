@@ -20,7 +20,7 @@ struct ComputeParams {
     bool double_buffering = true;
 };
 
-// Pre-allocated GPU buffers to avoid malloc/free overhead in hot path
+// Pre-allocated GPU buffers 
 struct GpuBuffers {
     int device_id = -1;
 
@@ -51,7 +51,7 @@ struct GpuBuffers {
     size_t max_chunk_elems = 0;
     bool is_double_buffering = false;
 
-    // ---- Pre-allocated CUDA resources (to avoid malloc/free in hot path) ----
+    // ---- Pre-allocated CUDA resources ----
     // Streams
     cudaStream_t stream_h2d = nullptr;      // H2D transfer stream
     cudaStream_t stream_compute = nullptr;  // Compute stream (also used as single stream)
@@ -77,7 +77,7 @@ struct GpuBuffers {
     // Free all buffers
     void free();
 
-    // Reset dC to zero (call before each compute iteration)
+    // Reset dC to zero
     void reset_output(cudaStream_t stream);
 };
 
@@ -85,16 +85,14 @@ struct GpuTimeTotal {
     float gemm_ms = 0.f;
     float h2d_ms  = 0.f;
     float cast_ms = 0.f;
-    // Actual elapsed time (accounts for overlap)
-    float total_elapsed_ms = 0.f;
+    //float total_elapsed_ms = 0.f;
 };
 
 /*
  * Compute C = X^T X on GPU.
  *
  * Inputs:
- *   X_local   : host pointer, row-major [rows_local x N]
- *   X_remote  : host pointer, row-major [rows_remote x N]
+ *   
  *
  * Output:
  *   C_out_rowmajor : host pointer, row-major [N x N]

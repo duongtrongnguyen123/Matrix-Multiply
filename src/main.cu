@@ -155,10 +155,7 @@ int main(int argc, char** argv) {
         
         std::vector<double> times;      // wall-clock times
         times.reserve(R);
-        
-        std::vector<double> gpu_times;  // max GPU times
-        gpu_times.reserve(R);
-        
+
         std::vector<double> h2d_times, cast_times, gemm_times;
         h2d_times.reserve(R);
         cast_times.reserve(R);
@@ -168,10 +165,9 @@ int main(int argc, char** argv) {
         
             const double t0 = now_sec();
         
-            // returns per-GPU stats
             std::vector<GpuTimeTotal> gpu_stats =
                 compute_xtx_multi_device(cp, X, C, gpu_buffers);
-        
+
             const double t1 = now_sec();
             const double wall_dt = t1 - t0;   // seconds
             times.push_back(wall_dt);
@@ -180,21 +176,18 @@ int main(int argc, char** argv) {
             double h2d_ms  = 0.0;
             double cast_ms = 0.0;
             double gemm_ms = 0.0;
-            double total_elapsed_ms = 0.0;
 
             for (size_t gi = 0 ; gi < gpu_stats.size() ; gi ++ ) {
                 const auto& g = gpu_stats[gi];
                 h2d_ms  = std::max(h2d_ms,  (double)g.h2d_ms);
                 cast_ms = std::max(cast_ms, (double)g.cast_ms);
                 gemm_ms = std::max(gemm_ms, (double)g.gemm_ms);
-                total_elapsed_ms = std::max(total_elapsed_ms, (double)g.total_elapsed_ms);
             }
 
             // ms -> seconds
             const double h2d_s  = h2d_ms  * 1e-3;
             const double cast_s = cast_ms * 1e-3;
             const double gemm_s = gemm_ms * 1e-3;
-            const double elapsed_s = total_elapsed_ms * 1e-3;
 
             h2d_times.push_back(h2d_s);
             cast_times.push_back(cast_s);
@@ -217,8 +210,6 @@ int main(int argc, char** argv) {
         };
         
         auto [t_min, t_med, t_mean, t_max] = stats(times);
-        
-        auto [gpu_min, gpu_med, gpu_mean, gpu_max] = stats(gpu_times);
         auto [h2d_min, h2d_med, h2d_mean, h2d_max] = stats(h2d_times);
         auto [cast_min, cast_med, cast_mean, cast_max] = stats(cast_times);
         auto [gemm_min, gemm_med, gemm_mean, gemm_max] = stats(gemm_times);
@@ -235,15 +226,9 @@ int main(int argc, char** argv) {
         std::cout << "median : " << t_med  * 1e3 << " ms\n";
         std::cout << "mean   : " << t_mean * 1e3 << " ms\n";
         std::cout << "max    : " << t_max  * 1e3 << " ms\n";
-        
-        std::cout << "[GPU total (h2d+cast+gemm)]\n";
-        std::cout << "min    : " << gpu_min  * 1e3 << " ms\n";
-        std::cout << "median : " << gpu_med  * 1e3 << " ms\n";
-        std::cout << "mean   : " << gpu_mean * 1e3 << " ms\n";
-        std::cout << "max    : " << gpu_max  * 1e3 << " ms\n";
-        std::cout << "approx GFLOP/s (min gpu time on slowest gpu): " << (GFLOPS / (num_devices * gemm_min)) << "\n";
-        std::cout << "approx GFLOP/s (median gpu on slowest gpu)  : " << (GFLOPS / (num_devices * gemm_med)) << "\n";
-        std::cout << "approx wall-total GFLOP/s                   : " << (GFLOPS / t_mean)                   << "\n\n";
+        std::cout << "approx GFLOP/s (min gemm time): " << (GFLOPS / (num_devices * gemm_min)) << "\n";
+        std::cout << "approx GFLOP/s (median gemm)  : " << (GFLOPS / (num_devices * gemm_med)) << "\n";
+        std::cout << "approx GFLOP/s (wall-clock)   : " << (GFLOPS / t_mean)                   << "\n\n";
 
         std::cout << "[GPU breakdown]\n";
         std::cout << "H2D   mean: " << h2d_mean  * 1e3 << " ms (median " << h2d_med  * 1e3 << ")\n";

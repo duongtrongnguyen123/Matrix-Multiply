@@ -313,19 +313,17 @@ void compute_xtx_double_buffering (
                 } else {                      // FP32 gemm
                     run_1_chunk_fp32_gemm(handle, N, static_cast<int>(K), dXf, dC, alpha, beta);
                 }
-            cudaEventRecord(gemm_stop[cid], stream_compute);
             }
+            cudaEventRecord(gemm_stop[cid], stream_compute);
         } else if (want_tf32) {
             cudaEventRecord(gemm_start[cid], stream_compute);
             if (mode.algorithm == "syrk") {   // TF32 syrk
                 run_1_chunk_fp32_syrk(handle, uplo, N, static_cast<int>(K), dXf, dC, alpha, beta);
             } else {
                 if (USE_CUBLASLT_XTX) {       // TF32 cublasLt
-                    cudaEventRecord(gemm_start[cid], stream_compute);
                     run_1_chunk_fp32_xtx_cublaslt(
                         N, static_cast<int>(K), dXf, dC, alpha, beta,
                         stream_compute, nullptr, CUBLASLT_WORKSPACE_BYTES, true);
-                    cudaEventRecord(gemm_stop[cid], stream_compute);
                 } else {                      // TF32 gemmex Tensor core
                     run_1_chunk_gemm_ex(handle, N, static_cast<int>(K), dXf, CUDA_R_32F, dC,
                                         alpha, beta, CUBLAS_COMPUTE_32F_FAST_TF32);
