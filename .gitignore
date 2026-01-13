@@ -4,9 +4,10 @@
 *.txt
 
 ####################################
-# Shell scripts
+# Output directories
 ####################################
-*.sh
+output_dir/
+.claude/
 
 # Nsight Systems profiler outputs
 *.nsys-rep
