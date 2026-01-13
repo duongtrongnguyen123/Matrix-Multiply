@@ -19,9 +19,12 @@
 #include <compute/xtx_cublas.h>
 #include <compute/xtx_cublasLt.h>
 
+// ===== cuBLASLt test knobs =====
+static constexpr bool USE_CUBLASLT_XTX = false;
+static constexpr bool CUBLASLT_ENABLE_TF32 = false;
+static constexpr size_t CUBLASLT_WORKSPACE_BYTES = 256ull * 1024 * 1024;  // 256 MB
 
 // ========== GpuBuffers implementation ==========
-
 void GpuBuffers::allocate(int dev_id, int64_t N, int64_t M_total, int64_t rows_per_chunk,
                           const std::string& dtype, bool double_buffering) {
     device_id = dev_id;
@@ -40,11 +43,11 @@ void GpuBuffers::allocate(int dev_id, int64_t N, int64_t M_total, int64_t rows_p
     // Allocate input buffers
     cuda_check(cudaMalloc(reinterpret_cast<void**>(&dX_ping), max_chunk_elems * sizeof(float)), "cudaMalloc dX_ping");
 
-    if (double_buffering) {
+    if (double_buffering) {      // 2 buffers for double buffering
         cuda_check(cudaMalloc(reinterpret_cast<void**>(&dX_pong), max_chunk_elems * sizeof(float)), "cudaMalloc dX_pong");
     }
 
-    // Allocate casted buffers based on dtype
+    // Allocate casted buffers 
     const bool want_fp16 = (dtype == "fp16");
     const bool want_bf16 = (dtype == "bf16");
 
@@ -161,13 +164,6 @@ void GpuBuffers::reset_output(cudaStream_t stream) {
         cuda_check(cudaMemsetAsync(dC, 0, bytes_C, stream), "cudaMemsetAsync dC reset");
     }
 }
-
-// ===== quick cublasLt XTX test knobs =====
-static constexpr bool USE_CUBLASLT_XTX = false;
-static constexpr bool CUBLASLT_ENABLE_TF32 = false;
-
-// 256 MB workspace for cublasLt
-static constexpr size_t CUBLASLT_WORKSPACE_BYTES = 256ull * 1024 * 1024;
 
 __global__ void mirror_triangle(float* C, int N, int upper_from_lower) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
