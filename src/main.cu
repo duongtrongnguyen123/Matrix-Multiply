@@ -16,7 +16,7 @@
 #include <config/xtx_config.h>
 #include <generate/xtx_generate.h>
 #include <compute/xtx_compute.h>
-#include <io/npy_save.h>
+#include <compute/utils.h>
 
 
 static inline double now_sec() {
@@ -68,7 +68,6 @@ int main(int argc, char** argv) {
     }
 
     std::string cfg_path = argv[1];
-
     try {
         Config cfg = load_config_yaml(cfg_path);
         size_t mode_idx = cfg.benchmark.mode_idx;
@@ -98,20 +97,31 @@ int main(int argc, char** argv) {
         size_t C_elems  = static_cast<size_t> (cfg.matrix.N) * static_cast<size_t> (cfg.matrix.N);
         size_t C_bytes  = C_elems * sizeof(float);
 
-        int home_node = /* gpu_node[home_gpu] */ 0;
+        int home_node = 0;   // default numa node
 
         float* C = reinterpret_cast<float*> (numa_alloc_onnode(C_bytes, home_node));
         if (!C) throw std::runtime_error("numa_alloc_onnode failed");
 
-        // (optional but recommended) first-touch to really back pages on that node
+        // first-touch to really back pages on that node
         #pragma omp parallel
         {
-            pin_thread_to_numa_node(home_node);   // if you have it; otherwise omit
+            pin_thread_to_numa_node(home_node);   
             #pragma omp for schedule(static)
             for (size_t k = 0; k < C_elems; ++k) C[k] = 0.0f;
         }
 
-        // ---- Pre-allocate GPU buffers (outside timing) ----
+        int visible = 0;
+        cuda_check(cudaGetDeviceCount(&visible), "cudaGetDeviceCount");
+        for (const auto& d : cfg.devices) {
+            if (d.device_id < 0 || d.device_id >= visible) {
+                throw std::runtime_error(
+                    "YAML device_id " + std::to_string(d.device_id) +
+                    " not visible at runtime (visible=" + std::to_string(visible) + ")"
+                );
+            }
+        }
+
+        // ---- Pre-allocate GPU buffers ----
         const size_t num_devices = cfg.devices.size();
         std::vector<GpuBuffers> gpu_buffers(num_devices);
         for (size_t i = 0; i < num_devices; ++i) {
@@ -146,7 +156,7 @@ int main(int argc, char** argv) {
         std::vector<double> times;      // wall-clock times
         times.reserve(R);
         
-        std::vector<double> gpu_times;  // max GPU's times
+        std::vector<double> gpu_times;  // max GPU times
         gpu_times.reserve(R);
         
         std::vector<double> h2d_times, cast_times, gemm_times;
@@ -166,7 +176,7 @@ int main(int argc, char** argv) {
             const double wall_dt = t1 - t0;   // seconds
             times.push_back(wall_dt);
         
-            // ---- MAX across GPUs (parallel execution time) ----
+            // ---- MAX across GPUs (parallel computing) ----
             double h2d_ms  = 0.0;
             double cast_ms = 0.0;
             double gemm_ms = 0.0;
@@ -180,7 +190,7 @@ int main(int argc, char** argv) {
                 total_elapsed_ms = std::max(total_elapsed_ms, (double)g.total_elapsed_ms);
             }
 
-            // convert ms -> seconds
+            // ms -> seconds
             const double h2d_s  = h2d_ms  * 1e-3;
             const double cast_s = cast_ms * 1e-3;
             const double gemm_s = gemm_ms * 1e-3;
@@ -189,13 +199,8 @@ int main(int argc, char** argv) {
             h2d_times.push_back(h2d_s);
             cast_times.push_back(cast_s);
             gemm_times.push_back(gemm_s);
-
-
-            // Use actual elapsed (accounts for overlap) instead of sum
-            gpu_times.push_back(elapsed_s);
         }
 
-        // ---- profiler stop ----
         cudaDeviceSynchronize();
 
 
@@ -254,7 +259,7 @@ int main(int argc, char** argv) {
         }
         
 
-        // 6) Save result as binary with dtype in filename (if enabled)
+        // Save result as binary
         if (cfg.output.save_result) {
             std::string out_path = cfg.output.output_dir + "/C_"
                 + std::to_string(cfg.matrix.N) + "x" + std::to_string(cfg.matrix.N)
@@ -272,6 +277,7 @@ int main(int argc, char** argv) {
                 std::cout << "Saved C to: " << out_path << " (" << (C_bytes + sizeof(N)) << " bytes)\n";
             }
         }
+        // ---- profiler stop ----
         cudaProfilerStop();
 
         return 0;

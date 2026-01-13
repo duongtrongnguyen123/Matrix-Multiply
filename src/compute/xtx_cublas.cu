@@ -58,3 +58,22 @@ void run_1_chunk_gemm_ex(
         "cublasGemmEx"
     );
 }
+
+void run_1_chunk_fp64_gemm(
+    cublasHandle_t h,
+    int N, int K,
+    const double* dX,
+    double* dC,
+    double alpha, double beta
+) {
+    cublas_check(
+        cublasDgemm(h, CUBLAS_OP_N, CUBLAS_OP_T,
+                    N, N, K,
+                    &alpha,
+                    dX, N,
+                    dX, N,
+                    &beta,
+                    dC, N),
+        "cublasDgemm"
+    );
+}

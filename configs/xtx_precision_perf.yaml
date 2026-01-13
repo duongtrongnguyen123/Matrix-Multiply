@@ -3,7 +3,7 @@ experiment:
     seed: 1234
     repeats: 2
     warmup_iters: 1
-    mode_idx: 2              # 0=fp32_syrk, 1=fp32_gemm, 2=tf32, 3=bf16, 4=fp16
+    mode_idx: 2              # 0=fp32_syrk, 1=fp32_gemm, 2=tf32, 3=bf16, 4=fp16, 5=fp64
     double_buffering: true   # true=double buffering, false=single buffering
 
 matrix:
@@ -18,15 +18,15 @@ chunking:
 
 host_memory:
   numa_mode: manual          # manual / auto (auto = detect nodes, default spread)
-  placement:
+  placement:                 # numa node id and fractions ratio it holds
     - { node: 0, frac: 1}
     #- { node: 1, frac: 0.5}
-  threads_per_node: 32
+  threads_per_node: 32       # num threads generating
   max_threads: 0
   pin_threads: true
   numa_aware: true
 
-devices:
+devices:                     # device id required for compute
     - device_id: 0
       backend: cublas
       usestreams: true
@@ -73,7 +73,15 @@ modes:
       accumulate: fp32
       cublas_math_mode: TENSOR_OP
       cast_on_gpu: true
-      algorithm: gemmEx 
+      algorithm: gemmEx
+
+    - name: fp64
+      input_dtype: fp64
+      compute: fp64
+      accumulate: fp64
+      cublas_math_mode: DEFAULT
+      cast_on_gpu: true
+      algorithm: gemmEx
 
 # gemm / syrk
 xtx:
@@ -90,8 +98,6 @@ metrics:
     error_norm: frobenius
 
 output:
-    save_result: false        # save C matrix as binary
+    save_result: true        # save C matrix as binary
     output_dir: "./output"    # directory for C_NxN_dtype.bin
-    result_csv: result.csv
-    log_level: info
 

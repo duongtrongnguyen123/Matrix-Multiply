@@ -2,7 +2,6 @@
 #include <cuda_fp16.h>
 #include <cublas_v2.h>
 #include <cuda_bf16.h>
-#include <nvtx3/nvToolsExt.h>
 
 #include <cstdio>
 #include <cstring>
@@ -61,6 +60,16 @@ void GpuBuffers::allocate(int dev_id, int64_t N, int64_t M_total, int64_t rows_p
         if (double_buffering) {
             cuda_check(cudaMalloc(reinterpret_cast<void**>(&dXb_pong), max_chunk_elems * sizeof(__nv_bfloat16)), "cudaMalloc dXb_pong");
         }
+    }
+
+    const bool want_fp64 = (dtype == "fp64");
+    if (want_fp64) {
+        cuda_check(cudaMalloc(reinterpret_cast<void**>(&dXd_ping), max_chunk_elems * sizeof(double)), "cudaMalloc dXd_ping");
+        if (double_buffering) {
+            cuda_check(cudaMalloc(reinterpret_cast<void**>(&dXd_pong), max_chunk_elems * sizeof(double)), "cudaMalloc dXd_pong");
+        }
+        // Allocate fp64 output buffer (N x N)
+        cuda_check(cudaMalloc(reinterpret_cast<void**>(&dC_fp64), static_cast<size_t>(N) * static_cast<size_t>(N) * sizeof(double)), "cudaMalloc dC_fp64");
     }
 
     // ---- Create CUDA streams ----
@@ -129,6 +138,9 @@ void GpuBuffers::free() {
     if (stream_compute) { cudaStreamDestroy(stream_compute); stream_compute = nullptr; }
 
     // Free device memory
+    if (dC_fp64)  { cudaFree(dC_fp64);  dC_fp64 = nullptr; }
+    if (dXd_pong) { cudaFree(dXd_pong); dXd_pong = nullptr; }
+    if (dXd_ping) { cudaFree(dXd_ping); dXd_ping = nullptr; }
     if (dXb_pong) { cudaFree(dXb_pong); dXb_pong = nullptr; }
     if (dXb_ping) { cudaFree(dXb_ping); dXb_ping = nullptr; }
     if (dXh_pong) { cudaFree(dXh_pong); dXh_pong = nullptr; }
@@ -154,7 +166,7 @@ void GpuBuffers::reset_output(cudaStream_t stream) {
 static constexpr bool USE_CUBLASLT_XTX = false;
 static constexpr bool CUBLASLT_ENABLE_TF32 = false;
 
-// 256 MB workspace is safe for most GEMM shapes
+// 256 MB workspace for cublasLt
 static constexpr size_t CUBLASLT_WORKSPACE_BYTES = 256ull * 1024 * 1024;
 
 __global__ void mirror_triangle(float* C, int N, int upper_from_lower) {
@@ -164,10 +176,10 @@ __global__ void mirror_triangle(float* C, int N, int upper_from_lower) {
     if (i == j) return;
 
     if (upper_from_lower) {
-        if (i < j) C[i + j * N] = C[j + i * N]; // C[i, j] = C[j, i]
+        if (i < j) C[i + j * N] = C[j + i * N]; // C[i, j] <- C[j, i]
     }
     else {
-        if (i > j) C[j + i * N] = C[i + j * N]; // C[j, i] = C[i, j]
+        if (i > j) C[j + i * N] = C[i + j * N]; // C[j, i] <- C[i, j]
     }
 }
 
@@ -202,7 +214,7 @@ void compute_xtx_double_buffering (
     // Use pre-allocated buffers
     float* dC = bufs.dC;
     size_t bytes_C = bufs.bytes_C;
-    bufs.reset_output(stream_compute);  // zero out dC
+    bufs.reset_output(stream_compute);
 
     const int64_t rows_per_chunk = params.chunking.rows_per_chunk;
 
@@ -221,28 +233,26 @@ void compute_xtx_double_buffering (
     const bool want_fp16 = (dtype == "fp16");
     const bool want_bf16 = (dtype == "bf16");
     const bool want_tf32 = (dtype == "tf32");
-    const bool want_fp32 = (!want_fp16 && !want_bf16 && !want_tf32);
+    const bool want_fp64 = (dtype == "fp64");
+    const bool want_fp32 = (!want_fp16 && !want_bf16 && !want_tf32 && !want_fp64);
+
+    // FP64 buffers
+    double* dXd_ping = bufs.dXd_ping;
+    double* dXd_pong = bufs.dXd_pong;
+    double* dC_fp64 = bufs.dC_fp64;
 
     const cublasFillMode_t uplo = parse_triangle(mode.triangle);
 
-    int max_chunks = (rows_local + rows_per_chunk - 1) / rows_per_chunk +
-                     (rows_remote + rows_per_chunk - 1) / rows_per_chunk;
-
-    // Use pre-allocated events (reference to bufs vectors)
+    // Use pre-allocated events
     std::vector<cudaEvent_t>& gemm_start = bufs.gemm_start;
     std::vector<cudaEvent_t>& gemm_stop = bufs.gemm_stop;
     std::vector<cudaEvent_t>& h2d_start = bufs.h2d_start;
     std::vector<cudaEvent_t>& h2d_stop = bufs.h2d_stop;
     std::vector<cudaEvent_t>& cast_start = bufs.cast_start;
     std::vector<cudaEvent_t>& cast_stop = bufs.cast_stop;
-
-    // Use pre-allocated sync events
     cudaEvent_t h2d_done = bufs.h2d_done;
     cudaEvent_t compute_done = bufs.compute_done;
-    cudaEvent_t overall_start = bufs.overall_start;
-    cudaEvent_t overall_stop = bufs.overall_stop;
 
-    int chunk_id = 0;
     bool use_ping = true;
 
     // Build list of all chunks to process
@@ -267,48 +277,62 @@ void compute_xtx_double_buffering (
     if (X_remote && rows_remote > 0) add_chunks(X_remote, rows_remote, false);
 
     if (chunks.empty()) {
-        // Nothing to process, just return
+        // Nothing to process, return
         // All resources are pre-allocated and will be freed by GpuBuffers::free()
         return;
     }
 
     // Helper lambda to run compute on a buffer
-    auto run_compute = [&](float* dXf, __half* dXh, __nv_bfloat16* dXb,
+    auto run_compute = [&](float* dXf, __half* dXh, __nv_bfloat16* dXb, double* dXd,
                            int64_t K, size_t elems, float beta, int cid) {
         const float alpha = scalars.alpha;
 
-        if (want_fp32) {
-            if (mode.algorithm == "syrk") {
+        if (want_fp64) {
+            // Cast fp32 input to fp64
+            int threads = 256;
+            int blocks = static_cast<int>((elems + threads - 1) / threads);
+            cudaEventRecord(cast_start[cid], stream_compute);
+            cast_f32_to<<<blocks, threads, 0, stream_compute>>>(dXf, dXd, elems);
+            cuda_check(cudaGetLastError(), "cast fp32 to fp64 kernel");
+            cudaEventRecord(cast_stop[cid], stream_compute);
+
+            // FP64 GEMM
+            cudaEventRecord(gemm_start[cid], stream_compute);
+            run_1_chunk_fp64_gemm(handle, N, static_cast<int>(K), dXd, dC_fp64,
+                                  static_cast<double>(alpha), static_cast<double>(beta));
+            cudaEventRecord(gemm_stop[cid], stream_compute);
+        } else if (want_fp32) {
+            cudaEventRecord(gemm_start[cid], stream_compute);
+            if (mode.algorithm == "syrk") {   // FP32 syrk
                 run_1_chunk_fp32_syrk(handle, uplo, N, static_cast<int>(K), dXf, dC, alpha, beta);
             } else {
-                if (USE_CUBLASLT_XTX) {
+                if (USE_CUBLASLT_XTX) {       // FP32 cublasLt
                     run_1_chunk_fp32_xtx_cublaslt(
                         N, static_cast<int>(K), dXf, dC, alpha, beta,
                         stream_compute, nullptr, CUBLASLT_WORKSPACE_BYTES, CUBLASLT_ENABLE_TF32);
-                } else {
-                    cudaEventRecord(gemm_start[cid], stream_compute);
+                } else {                      // FP32 gemm
                     run_1_chunk_fp32_gemm(handle, N, static_cast<int>(K), dXf, dC, alpha, beta);
-                    cudaEventRecord(gemm_stop[cid], stream_compute);
                 }
+            cudaEventRecord(gemm_stop[cid], stream_compute);
             }
         } else if (want_tf32) {
-            if (mode.algorithm == "syrk") {
+            cudaEventRecord(gemm_start[cid], stream_compute);
+            if (mode.algorithm == "syrk") {   // TF32 syrk
                 run_1_chunk_fp32_syrk(handle, uplo, N, static_cast<int>(K), dXf, dC, alpha, beta);
             } else {
-                if (USE_CUBLASLT_XTX) {
+                if (USE_CUBLASLT_XTX) {       // TF32 cublasLt
                     cudaEventRecord(gemm_start[cid], stream_compute);
                     run_1_chunk_fp32_xtx_cublaslt(
                         N, static_cast<int>(K), dXf, dC, alpha, beta,
                         stream_compute, nullptr, CUBLASLT_WORKSPACE_BYTES, true);
                     cudaEventRecord(gemm_stop[cid], stream_compute);
-                } else {
-                    cudaEventRecord(gemm_start[cid], stream_compute);
+                } else {                      // TF32 gemmex Tensor core
                     run_1_chunk_gemm_ex(handle, N, static_cast<int>(K), dXf, CUDA_R_32F, dC,
                                         alpha, beta, CUBLAS_COMPUTE_32F_FAST_TF32);
-                    cudaEventRecord(gemm_stop[cid], stream_compute);
                 }
             }
-        } else if (want_fp16) {
+            cudaEventRecord(gemm_stop[cid], stream_compute);
+        } else if (want_fp16) {               // FP16 tensor core
             int threads = 256;
             int blocks = static_cast<int>((elems + threads - 1) / threads);
             cudaEventRecord(cast_start[cid], stream_compute);
@@ -320,7 +344,7 @@ void compute_xtx_double_buffering (
             run_1_chunk_gemm_ex(handle, N, static_cast<int>(K), dXh, CUDA_R_16F, dC,
                                 alpha, beta, CUBLAS_COMPUTE_32F);
             cudaEventRecord(gemm_stop[cid], stream_compute);
-        } else { // bf16
+        } else {                              // BF16 tensor core
             int threads = 256;
             int blocks = static_cast<int>((elems + threads - 1) / threads);
             cudaEventRecord(cast_start[cid], stream_compute);
@@ -336,18 +360,14 @@ void compute_xtx_double_buffering (
     };
 
     // Prime the pipeline: start H2D for first chunk
-    nvtxRangePush("XTX_double_buffer");
-    cudaEventRecord(overall_start, stream_h2d);  // Mark start of all GPU work
     {
         const auto& c = chunks[0];
         const size_t elems = static_cast<size_t>(c.rows) * static_cast<size_t>(N);
-        nvtxRangePush("H2D_chunk_0");
         cudaEventRecord(h2d_start[0], stream_h2d);
         cuda_check(cudaMemcpyAsync(dX_ping, c.src + c.offset * N, elems * sizeof(float),
                                    cudaMemcpyHostToDevice, stream_h2d), "H2D chunk 0");
         cudaEventRecord(h2d_stop[0], stream_h2d);
         cudaEventRecord(h2d_done, stream_h2d);
-        nvtxRangePop();
     }
 
     // Process all chunks with double buffering
@@ -362,7 +382,8 @@ void compute_xtx_double_buffering (
         __half* dXh_next = use_ping ? dXh_pong : dXh_ping;
         __nv_bfloat16* dXb_curr = use_ping ? dXb_ping : dXb_pong;
         __nv_bfloat16* dXb_next = use_ping ? dXb_pong : dXb_ping;
-        (void)dXh_next; (void)dXb_next; // suppress unused warnings
+        double* dXd_curr = use_ping ? dXd_ping : dXd_pong;
+        double* dXd_next = use_ping ? dXd_pong : dXd_ping;
 
         // Wait for H2D of current chunk to complete before computing
         cuda_check(cudaStreamWaitEvent(stream_compute, h2d_done, 0), "wait h2d_done");
@@ -384,21 +405,11 @@ void compute_xtx_double_buffering (
         }
 
         // Run compute on current chunk
-        {
-            char buf[64];
-            snprintf(buf, sizeof(buf), "GEMM_chunk_%zu", i);
-            nvtxRangePush(buf);
-        }
-        run_compute(dXf_curr, dXh_curr, dXb_curr, c.rows, elems, beta, static_cast<int>(i));
-        nvtxRangePop();
+        run_compute(dXf_curr, dXh_curr, dXb_curr, dXd_curr, c.rows, elems, beta, static_cast<int>(i));
         cudaEventRecord(compute_done, stream_compute);
 
         use_ping = !use_ping;
-        chunk_id++;
     }
-
-    // Record overall stop after all chunks processed
-    cudaEventRecord(overall_stop, stream_compute);
 
     // Mirror triangle if using syrk
     if (want_fp32 && mode.algorithm == "syrk") {
@@ -409,20 +420,28 @@ void compute_xtx_double_buffering (
         cuda_check(cudaGetLastError(), "mirror_triangle kernel");
     }
 
-    // Copy result back to host
+    // Cast fp64 output to fp32 for storage
+    if (want_fp64) {
+        size_t C_elems = static_cast<size_t>(N) * static_cast<size_t>(N);
+        int threads = 256;
+        int blocks = static_cast<int>((C_elems + threads - 1) / threads);
+        cast_f64_to_f32<<<blocks, threads, 0, stream_compute>>>(dC_fp64, dC, C_elems);
+        cuda_check(cudaGetLastError(), "cast fp64 to fp32 output kernel");
+    }
+
+    // copy back if required
     if (copy_back) {
         cuda_check(cudaMemcpyAsync(C_out_row_major, dC, bytes_C,
                                    cudaMemcpyDeviceToHost, stream_compute), "D2H result");
     }
     cuda_check(cudaStreamSynchronize(stream_compute), "sync compute stream");
     cuda_check(cudaStreamSynchronize(stream_h2d), "sync h2d stream");
-    nvtxRangePop();  // XTX_double_buffer
 
-    // Collect timing
+    // Timing
     float gemm_ms_total = 0.0f;
     float h2d_ms_total = 0.0f;
     float cast_ms_total = 0.0f;
-    for (int i = 0; i < chunk_id; ++i) {
+    for (size_t i = 0; i < chunks.size(); ++i) {
         float gemm = 0.f;
         cudaEventElapsedTime(&gemm, gemm_start[i], gemm_stop[i]);
         gemm_ms_total += gemm;
@@ -440,17 +459,6 @@ void compute_xtx_double_buffering (
     time.gemm_ms = gemm_ms_total;
     time.h2d_ms  = h2d_ms_total;
     time.cast_ms = cast_ms_total;
-
-    // DEBUG: Print timing values
-    printf("[DEBUG double_buf] chunks=%d h2d=%.2f cast=%.2f gemm=%.2f ms\n",
-           chunk_id, h2d_ms_total, cast_ms_total, gemm_ms_total);
-
-    // Measure actual elapsed time (accounts for H2D/GEMM overlap)
-    float overall_elapsed = 0.f;
-    cudaEventElapsedTime(&overall_elapsed, overall_start, overall_stop);
-    time.total_elapsed_ms = overall_elapsed;
-
-    // No cleanup needed - all resources are pre-allocated and will be freed by GpuBuffers::free()
 }
 
 static void compute_xtx_single_device(
@@ -482,7 +490,7 @@ static void compute_xtx_single_device(
     // Use pre-allocated buffers
     float* dC = bufs.dC;
     size_t bytesC = bufs.bytes_C;
-    bufs.reset_output(stream);  // zero out dC
+    bufs.reset_output(stream);
 
     const int64_t rows_per_chunk = params.chunking.rows_per_chunk;
 
@@ -492,6 +500,8 @@ static void compute_xtx_single_device(
     // Casted buffers (pre-allocated)
     __half* dXh = bufs.dXh_ping;
     __nv_bfloat16* dXb = bufs.dXb_ping;
+    double* dXd = bufs.dXd_ping;
+    double* dC_fp64 = bufs.dC_fp64;
 
     // compute type
     const std::string& dtype = mode.name;
@@ -499,15 +509,12 @@ static void compute_xtx_single_device(
     const bool want_fp16 = (dtype == "fp16");
     const bool want_bf16 = (dtype == "bf16");
     const bool want_tf32 = (dtype == "tf32");
-    const bool want_fp32 = (!want_fp16 && !want_bf16 && !want_tf32);
+    const bool want_fp64 = (dtype == "fp64");
+    const bool want_fp32 = (!want_fp16 && !want_bf16 && !want_tf32 && !want_fp64);
 
-    // timer to time H2D time, compute time, casting time
     const cublasFillMode_t uplo = parse_triangle(mode.triangle);
 
-    int max_chunks = (rows_local + rows_per_chunk - 1) / rows_per_chunk +
-                     (rows_remote + rows_per_chunk - 1) / rows_per_chunk;
-
-    // Use pre-allocated events (reference to bufs vectors)
+    // Use pre-allocated events
     std::vector<cudaEvent_t>& gemm_start = bufs.gemm_start;
     std::vector<cudaEvent_t>& gemm_stop = bufs.gemm_stop;
     std::vector<cudaEvent_t>& h2d_start = bufs.h2d_start;
@@ -517,7 +524,6 @@ static void compute_xtx_single_device(
 
     int chunk_id = 0;
 
-    // X points to DRAM, diff with dXf
     auto process_source = [&](const float* X, int64_t rows) {
         int64_t done = 0;
         while (done < rows) {
@@ -534,14 +540,13 @@ static void compute_xtx_single_device(
                     "cudaMemcpuAsync dXf -> X"
             );
             cudaEventRecord(h2d_stop[chunk_id], stream);
-            // stop H2D timer
 
             const float alpha = scalars.alpha;
             const float beta  = (done == 0 && X == X_local) ? scalars.beta_first : scalars.beta_rest;
 
 
             if (want_fp32) {
-
+                cudaEventRecord(gemm_start[chunk_id], stream);
                 if (mode.algorithm == "syrk") {
                     run_1_chunk_fp32_syrk(handle, uplo,
                                           N, static_cast<int> (K), 
@@ -560,18 +565,18 @@ static void compute_xtx_single_device(
                             /*enable_tf32=*/CUBLASLT_ENABLE_TF32
                         );
                     } else {
-                        cudaEventRecord(gemm_start[chunk_id], stream);
                         run_1_chunk_fp32_gemm(handle,
                                               N, static_cast<int>(K),
                                               dXf, dC,
                                               alpha, beta);
-                        cudaEventRecord(gemm_stop[chunk_id], stream);
                     }
                 }
+                cudaEventRecord(gemm_stop[chunk_id], stream);
             }
             else if (want_tf32) {
+                cudaEventRecord(gemm_start[chunk_id], stream);
                 if (mode.algorithm == "syrk") {
-                    // preserve same logic as fp32 path
+                    
                     run_1_chunk_fp32_syrk(handle, uplo,
                                           N, static_cast<int>(K),
                                           dXf, dC,
@@ -579,7 +584,6 @@ static void compute_xtx_single_device(
                 }
                 else {
                     if (USE_CUBLASLT_XTX) {
-                        cudaEventRecord(gemm_start[chunk_id], stream);
                         run_1_chunk_fp32_xtx_cublaslt(
                             N, static_cast<int>(K),
                             dXf, dC,
@@ -589,22 +593,34 @@ static void compute_xtx_single_device(
                             /*workspace_bytes=*/CUBLASLT_WORKSPACE_BYTES,
                             /*enable_tf32=*/true
                         );
-                        cudaEventRecord(gemm_stop[chunk_id], stream);
                     } 
-                    else {
-                        // fp32 inputs, TF32 tensorcore compute, fp32 accumulate
-                        cudaEventRecord(gemm_start[chunk_id], stream);
+                    else {                   // TF32 Tensor core compute, FP32 accumulate
                         run_1_chunk_gemm_ex(handle,
                                             N, static_cast<int>(K),
                                             dXf, CUDA_R_32F,
                                             dC,
                                             alpha, beta,
                                             CUBLAS_COMPUTE_32F_FAST_TF32);
-                        cudaEventRecord(gemm_stop[chunk_id], stream);
                     }
                 }
-                
+                cudaEventRecord(gemm_stop[chunk_id], stream);
             }
+            else if (want_fp64) {            // FP64 compute, FP64 accumulate
+                int thread = 256;
+                int blocks = static_cast<int>((elems + thread - 1) / thread);
+
+                cudaEventRecord(cast_start[chunk_id], stream);
+                cast_f32_to<<<blocks, thread, 0, stream>>>(dXf, dXd, elems);
+                cuda_check(cudaGetLastError(), "cast fp32 to fp64 kernel");
+                cudaEventRecord(cast_stop[chunk_id], stream);
+
+                cudaEventRecord(gemm_start[chunk_id], stream);
+                run_1_chunk_fp64_gemm(handle,
+                                      N, static_cast<int>(K),
+                                      dXd, dC_fp64,
+                                      static_cast<double>(alpha), static_cast<double>(beta));
+                cudaEventRecord(gemm_stop[chunk_id], stream);
+            }                               // FP 16 Tensor core compute, FP32 accumulate
             else if (want_fp16) {
                 int thread = 256;
                 int blocks = static_cast<int>((elems + thread - 1) / thread);
@@ -613,17 +629,17 @@ static void compute_xtx_single_device(
                 cast_f32_to<<<blocks, thread, 0, stream>>>(dXf, dXh, elems);
                 cuda_check(cudaGetLastError(), "cast fp32 to fp16 kernel");
                 cudaEventRecord(cast_stop[chunk_id], stream);
-                
+
                 cudaEventRecord(gemm_start[chunk_id], stream);
-                run_1_chunk_gemm_ex(handle, 
+                run_1_chunk_gemm_ex(handle,
                                     N, static_cast<int> (K),
-                                    dXh, CUDA_R_16F, 
-                                    dC, 
-                                    alpha, beta, 
+                                    dXh, CUDA_R_16F,
+                                    dC,
+                                    alpha, beta,
                                     CUBLAS_COMPUTE_32F);
                 cudaEventRecord(gemm_stop[chunk_id], stream);
             }
-            else {
+            else {                          // BF16 Tensor core compute, FP32 accumulate
                 int thread = 256;
                 int blocks = static_cast<int>((elems + thread - 1) / thread);
 
@@ -659,14 +675,21 @@ static void compute_xtx_single_device(
         cuda_check(cudaGetLastError(), "mirror_triangle kernel");
     }
 
-    // storage to host from device
-    // interpreting col-major as row-major
+    // Cast fp64 output to fp32 for storage
+    if (want_fp64) {
+        size_t C_elems = static_cast<size_t>(N) * static_cast<size_t>(N);
+        int threads = 256;
+        int blocks = static_cast<int>((C_elems + threads - 1) / threads);
+        cast_f64_to_f32<<<blocks, threads, 0, stream>>>(dC_fp64, dC, C_elems);
+        cuda_check(cudaGetLastError(), "cast fp64 to fp32 output kernel");
+    }
+
     if (copy_back) {
         cuda_check(cudaMemcpyAsync(C_out_row_major, dC, bytesC, cudaMemcpyDeviceToHost, stream), "cudaMemcopyAsync device 2 host");
-    }        
+    }
     cuda_check(cudaStreamSynchronize(stream), "cudaStreamSynchronize");
 
-
+    // Timing
     float gemm_ms_total = 0.0f;
     float h2d_ms_total = 0.0f;
     float cast_ms_total = 0.0f;
@@ -679,7 +702,7 @@ static void compute_xtx_single_device(
         cudaEventElapsedTime(&h2d, h2d_start[i], h2d_stop[i]);
         h2d_ms_total += h2d;
 
-        if (!want_fp32) {
+        if (!want_fp32 && !want_tf32) {
             float cast = 0.f;
             cudaEventElapsedTime(&cast, cast_start[i], cast_stop[i]);
             cast_ms_total += cast;
@@ -688,18 +711,7 @@ static void compute_xtx_single_device(
     time.gemm_ms = gemm_ms_total;
     time.h2d_ms  = h2d_ms_total;
     time.cast_ms = cast_ms_total;
-    // No overlap in single buffering, so total = sum of components
-    time.total_elapsed_ms = h2d_ms_total + cast_ms_total + gemm_ms_total;
-
-    // DEBUG: Print timing values
-    printf("[DEBUG single_buf] chunks=%d h2d=%.2f cast=%.2f gemm=%.2f ms\n",
-           chunk_id, h2d_ms_total, cast_ms_total, gemm_ms_total);
-
-    // No cleanup needed - all resources are pre-allocated and will be freed by GpuBuffers::free()
 }
-
-
-
 
 std::vector<GpuTimeTotal> compute_xtx_multi_device(
     const ComputeParams& params,
@@ -707,21 +719,8 @@ std::vector<GpuTimeTotal> compute_xtx_multi_device(
     float* C_out_row_major,
     std::vector<GpuBuffers>& gpu_buffers
 ) {
-    int visible = 0;
-    cuda_check(cudaGetDeviceCount(&visible), "cudaGetDeviceCount");
-
     const int used = (int)params.devices.size();
     if (used == 0) throw std::runtime_error("params.devices is empty");
-
-    // validate YAML device ids exist at runtime
-    for (const auto& d : params.devices) {
-        if (d.device_id < 0 || d.device_id >= visible) {
-            throw std::runtime_error(
-                "YAML device_id " + std::to_string(d.device_id) +
-                " not visible at runtime (visible=" + std::to_string(visible) + ")"
-            );
-        }
-    }
 
     // times
     std::vector<GpuTimeTotal> times(used);
@@ -733,17 +732,17 @@ std::vector<GpuTimeTotal> compute_xtx_multi_device(
         const NodeBuffer* src0 = nullptr;  // primary source
         const NodeBuffer* src1 = nullptr;  // optional second source
         
-        // 1) Prefer a buffer that matches the GPU NUMA node
+        // Prefer buffer that matches the GPU NUMA node
         for (const auto& b : X.bufs) {
             if (b.node == gpu_node) { src0 = &b; break; }
         }
         
-        // 2) Fallback: if no "local-to-GPU" buffer exists, pick the first buffer
+        // Fallback: if no "local-to-GPU" buffer exists, pick the first buffer
         if (!src0) {
             src0 = &X.bufs[0];
         }
         
-        // 3) Pick a second, distinct buffer (if any)
+        // Pick a second, distinct buffer
         for (const auto& b : X.bufs) {
             if (&b != src0) { src1 = &b; break; }
         }
@@ -781,8 +780,6 @@ std::vector<GpuTimeTotal> compute_xtx_multi_device(
         const int device_id = params.devices[i].device_id;
 
         gpu_threads.emplace_back([&, i, device_id] {
-            // per-thread params copy so we can set device_id without races
-
             // detect which NUMA node this GPU is closest to
             const int gpu_node = gpu_to_numa_node(device_id);
 

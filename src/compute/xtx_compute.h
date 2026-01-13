@@ -43,6 +43,11 @@ struct GpuBuffers {
     __nv_bfloat16* dXb_ping = nullptr;
     __nv_bfloat16* dXb_pong = nullptr;
 
+    // Casted buffers for fp64 (ground truth reference)
+    double* dXd_ping = nullptr;
+    double* dXd_pong = nullptr;
+    double* dC_fp64 = nullptr;  // FP64 output buffer (will be cast to fp32 at end)
+
     size_t max_chunk_elems = 0;
     bool is_double_buffering = false;
 
