@@ -1,0 +1,25 @@
+# Build artifacts
+xtx_bench
+*.o
+*.out
+
+# Profiler files
+*.nsys-rep
+*.sqlite
+
+# Output
+output_dir/
+*.txt
+
+# Git
+.git/
+.gitignore
+
+# IDE
+.vscode/
+.idea/
+.claude/
+
+# Docs
+*.pdf
+README.md
