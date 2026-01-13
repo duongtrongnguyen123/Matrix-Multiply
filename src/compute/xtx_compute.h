@@ -18,6 +18,7 @@ struct ComputeParams {
     const ComputeScalars& scalars;
     int64_t N;  // from matrix config
     bool double_buffering = true;
+    bool copy_back = false;  // copy result from GPU to host (D2H)
 };
 
 // Pre-allocated GPU buffers 

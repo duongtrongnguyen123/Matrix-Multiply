@@ -65,6 +65,7 @@ struct ComputeScalars {
 
 struct OutputCfg {
     bool save_result = false;
+    bool copy_back = false;           // copy result from GPU to host (D2H)
     std::string output_dir = ".";
 };
 

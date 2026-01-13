@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Evaluate matrix multiplication results across different compute dtypes.
-Uses fp32 as reference and computes error metrics for bf16 and tf32.
+Uses fp64 as reference and computes error metrics for fp32, tf32, bf16, fp16.
 """
 
 import numpy as np
@@ -66,7 +66,7 @@ def compute_metrics(ref: np.ndarray, test: np.ndarray, name: str) -> dict:
 def print_metrics(metrics: dict):
     """Print metrics in a formatted way."""
     print(f"\n{'=' * 50}")
-    print(f"  {metrics['name']} vs fp32 (reference)")
+    print(f"  {metrics['name']} vs fp64 (reference)")
     print(f"{'=' * 50}")
     print(f"  Max absolute error:    {metrics['max_abs_err']:.6e}")
     print(f"  Mean absolute error:   {metrics['mean_abs_err']:.6e}")
@@ -138,6 +138,7 @@ def main():
 
     if not output_dir.exists():
         print(f"Error: Directory '{output_dir}' not found")
+        print(f"Usage: {sys.argv[0]} [output_dir]")
         sys.exit(1)
 
     # Find matrix files
@@ -163,21 +164,22 @@ def main():
     print(f"  Range: [{ref_matrix.min():.6e}, {ref_matrix.max():.6e}]")
     print(f"  Mean:  {ref_matrix.mean():.6e}")
 
-    # Evaluate other dtypes
+    # Evaluate other dtypes in consistent order
+    eval_dtypes = ['fp32', 'tf32', 'bf16', 'fp16']
     all_metrics = []
-    for bin_file in bin_files:
-        if 'fp64' in bin_file.name.lower():
-            continue
 
-        # Extract dtype name from filename
-        dtype_name = bin_file.stem.split('_')[-1]
+    for dtype in eval_dtypes:
+        bin_file = next((f for f in bin_files if f"_{dtype}.bin" in f.name.lower()), None)
+        if not bin_file:
+            print(f"\n  {dtype}: file not found")
+            continue
 
         print(f"\nLoading {bin_file.name}...")
         test_matrix = load_matrix_bin(bin_file)
         print(f"  Shape: {test_matrix.shape}")
         print(f"  Range: [{test_matrix.min():.6e}, {test_matrix.max():.6e}]")
 
-        metrics = compute_metrics(ref_matrix, test_matrix, dtype_name)
+        metrics = compute_metrics(ref_matrix, test_matrix, dtype)
         all_metrics.append(metrics)
         print_metrics(metrics)
 

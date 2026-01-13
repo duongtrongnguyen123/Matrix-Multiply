@@ -752,7 +752,7 @@ std::vector<GpuTimeTotal> compute_xtx_multi_device(
                 src0->ptr, src0->rows,
                 src1 ? src1->ptr : nullptr,
                 src1 ? src1->rows : 0,
-                C_out_row_major, true,  // copy_back = true for single GPU
+                C_out_row_major, params.copy_back,
                 gpu_buffers[0],
                 times[0]);
         } else {
@@ -761,7 +761,7 @@ std::vector<GpuTimeTotal> compute_xtx_multi_device(
                 src0->ptr, src0->rows,
                 src1 ? src1->ptr : nullptr,
                 src1 ? src1->rows : 0,
-                C_out_row_major, true,  // copy_back = true for single GPU
+                C_out_row_major, params.copy_back,
                 gpu_buffers[0],
                 times[0]);
         }

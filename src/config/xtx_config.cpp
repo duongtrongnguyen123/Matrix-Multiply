@@ -128,6 +128,7 @@ Config load_config_yaml(const std::string& path) {
     if (root["output"]) {
         auto o = root["output"];
         if (o["save_result"]) output.save_result = o["save_result"].as<bool>();
+        if (o["copy_back"])   output.copy_back   = o["copy_back"].as<bool>();
         if (o["output_dir"])  output.output_dir  = o["output_dir"].as<std::string>();
     }
     

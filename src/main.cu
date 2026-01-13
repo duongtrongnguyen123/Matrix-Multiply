@@ -86,7 +86,7 @@ int main(int argc, char** argv) {
             * (double)cfg.matrix.N
             * (double)(cfg.matrix.N + 1);
         GenerateParams gp{cfg.matrix, cfg.host_memory};
-        ComputeParams  cp{cfg.chunking, cfg.devices, mode, cfg.compute_scalars, cfg.matrix.N, cfg.benchmark.double_buffering};
+        ComputeParams  cp{cfg.chunking, cfg.devices, mode, cfg.compute_scalars, cfg.matrix.N, cfg.benchmark.double_buffering, cfg.output.copy_back};
 
 
         // Initialize CUDA context before cudaHostRegister is called in threads

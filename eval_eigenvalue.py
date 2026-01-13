@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-Compute smallest eigenvalue of matrices for different compute dtypes.
-Uses shift-invert mode for efficient computation of smallest eigenvalue.
+Compute smallest and largest eigenvalues of matrices for different compute dtypes.
+Uses ARPACK for efficient computation. Reference: fp64.
 """
 
 import numpy as np
@@ -19,15 +19,12 @@ def load_matrix_bin(filepath: str) -> np.ndarray:
         return data.reshape(N, N)
 
 
-def compute_smallest_eigenvalue(matrix: np.ndarray, k: int = 1) -> float:
-    """
-    Compute smallest eigenvalue using ARPACK's shift-invert mode.
-    Much faster than full eigendecomposition for large matrices.
-    """
-    # Use shift-invert with sigma=0 to find smallest eigenvalues
-    # which='LM' with sigma finds eigenvalues closest to sigma
-    eigenvalues, _ = eigsh(matrix.astype(np.float64), k=k, which='SM', tol=1e-8)
-    return np.min(eigenvalues)
+def compute_eigenvalues(matrix: np.ndarray) -> tuple:
+    """Compute smallest and largest eigenvalue using ARPACK."""
+    mat64 = matrix.astype(np.float64)
+    eig_sm, _ = eigsh(mat64, k=1, which='SM', tol=1e-10)
+    eig_lm, _ = eigsh(mat64, k=1, which='LM', tol=1e-10)
+    return eig_sm[0], eig_lm[0]
 
 
 def main():
@@ -35,11 +32,17 @@ def main():
     if len(sys.argv) > 1:
         output_dir = Path(sys.argv[1])
 
-    dtypes = ['fp32', 'bf16', 'tf32']
+    if not output_dir.exists():
+        print(f"Error: Directory '{output_dir}' not found")
+        print(f"Usage: {sys.argv[0]} [output_dir]")
+        sys.exit(1)
+
+    # All dtypes, fp64 first as reference
+    dtypes = ['fp64', 'fp32', 'tf32', 'bf16', 'fp16']
     results = {}
 
-    print("Computing smallest eigenvalue for each dtype...")
-    print("=" * 60)
+    print("Computing eigenvalues for each dtype (reference: fp64)")
+    print("=" * 70)
     sys.stdout.flush()
 
     for dtype in dtypes:
@@ -53,38 +56,49 @@ def main():
 
         matrix = load_matrix_bin(bin_file)
         print(f"  Shape: {matrix.shape}", flush=True)
+        print(f"  Computing eigenvalues (ARPACK)...", flush=True)
 
-        print(f"  Computing smallest eigenvalue (ARPACK)...", flush=True)
         try:
-            eig_min = compute_smallest_eigenvalue(matrix)
-            results[dtype] = eig_min
-            print(f"  Smallest eigenvalue: {eig_min:.10e}", flush=True)
+            eig_sm, eig_lm = compute_eigenvalues(matrix)
+            results[dtype] = {'smallest': eig_sm, 'largest': eig_lm}
+            print(f"  Smallest: {eig_sm:.10e}", flush=True)
+            print(f"  Largest:  {eig_lm:.10e}", flush=True)
         except Exception as e:
             print(f"  Error: {e}", flush=True)
 
     # Summary table
-    print("\n" + "=" * 60)
-    print("  Summary: Smallest Eigenvalues")
-    print("=" * 60)
-    print(f"{'dtype':<10} {'smallest eigenvalue':>25}")
-    print("-" * 60)
+    print("\n" + "=" * 90)
+    print("  Summary: Eigenvalues (reference: fp64)")
+    print("=" * 90)
+    print(f"{'dtype':<8} {'smallest':>22} {'diff':>15} {'largest':>22} {'diff':>15}")
+    print("-" * 90)
+
+    ref_sm = results.get('fp64', {}).get('smallest', 0)
+    ref_lm = results.get('fp64', {}).get('largest', 0)
 
     for dtype in dtypes:
         if dtype in results:
-            print(f"{dtype:<10} {results[dtype]:>25.10e}")
+            sm = results[dtype]['smallest']
+            lm = results[dtype]['largest']
+            diff_sm = sm - ref_sm if ref_sm else 0
+            diff_lm = lm - ref_lm if ref_lm else 0
+            print(f"{dtype:<8} {sm:>22.10e} {diff_sm:>+15.4e} {lm:>22.10e} {diff_lm:>+15.4e}")
 
-    # Compare vs fp32
-    if 'fp32' in results:
+    # Relative errors
+    if 'fp64' in results:
         print("\n" + "-" * 60)
-        print("Difference from fp32 reference:")
-        ref = results['fp32']
-        for dtype in ['bf16', 'tf32']:
-            if dtype in results:
-                diff = results[dtype] - ref
-                rel_diff = abs(diff / ref) * 100 if ref != 0 else float('nan')
-                print(f"  {dtype}: {diff:+.10e} ({rel_diff:.6f}% relative)")
+        print("Relative errors vs fp64:")
+        print(f"{'dtype':<8} {'smallest rel%':>18} {'largest rel%':>18}")
+        print("-" * 60)
+        for dtype in dtypes:
+            if dtype != 'fp64' and dtype in results:
+                sm = results[dtype]['smallest']
+                lm = results[dtype]['largest']
+                rel_sm = abs(sm - ref_sm) / ref_sm * 100 if ref_sm else 0
+                rel_lm = abs(lm - ref_lm) / ref_lm * 100 if ref_lm else 0
+                print(f"{dtype:<8} {rel_sm:>17.6f}% {rel_lm:>17.6f}%")
 
-    print("=" * 60)
+    print("=" * 90)
 
 
 if __name__ == "__main__":

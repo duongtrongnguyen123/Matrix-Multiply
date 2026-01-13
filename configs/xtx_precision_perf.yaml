@@ -3,17 +3,17 @@ experiment:
     seed: 1234
     repeats: 2
     warmup_iters: 1
-    mode_idx: 2              # 0=fp32_syrk, 1=fp32_gemm, 2=tf32, 3=bf16, 4=fp16, 5=fp64
+    mode_idx: 3              # 0=fp32_syrk, 1=fp32_gemm, 2=tf32, 3=bf16, 4=fp16, 5=fp64
     double_buffering: true   # true=double buffering, false=single buffering
 
 matrix:
-    M: 393216
-    N: 8192
+    M: 293912
+    N: 12288
     dtype_storage: fp32
     layout: row_major
 
 chunking: 
-    rows_per_chunk: 8192
+    rows_per_chunk: 12288
     pinned_buffers: 1
 
 host_memory:
@@ -98,6 +98,7 @@ metrics:
     error_norm: frobenius
 
 output:
-    save_result: true        # save C matrix as binary
+    save_result: false        # save C matrix as binary
+    copy_back: false          # copy result from GPU to host (D2H)
     output_dir: "./output"    # directory for C_NxN_dtype.bin
 
