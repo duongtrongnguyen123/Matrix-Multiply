@@ -46,6 +46,7 @@ static void print_config(const Config& cfg, const ModeCfg& mode) {
     std::cout  << "repeats      " << cfg.benchmark.repeats << std::endl;
     std::cout  << "mode_idx     " << cfg.benchmark.mode_idx << std::endl;
     std::cout  << "double_buf   " << (cfg.benchmark.double_buffering ? "true" : "false") << std::endl;
+    std::cout  << "copy_back    " << (cfg.output.copy_back ? "true" : "false") << std::endl;
     /* 
     for (size_t i = 0 ; i < cfg.modes.size() ; i ++ ) {
         std::cout << " | input dtype = " << cfg.modes[i].input_dtype << std::endl;
