@@ -1,6 +1,6 @@
 # System-Level Optimization of Large-Scale Matrix Multiplication on GPUs
 
-Report (PDF): [benchmark_report.pdf](https://duongtrongnguyen123.github.io/Matrix-Multiply/benchmark_report.pdf)
+Report (PDF): [out-of-core-gpu-matmul-report.pdf](docs/out-of-core-gpu-matmul-report.pdf)
 
 Matrix multiplication is a core operation in large-scale data analysis and machine learning workloads. When matrix sizes exceed device memory capacity, overall performance is often dominated not by compute throughput but by host-device data movement and memory management.
 
@@ -24,6 +24,12 @@ This project focuses on engineering efficient end-to-end matrix multiplication p
 
 ## Build
 
+Recommended (compiles for the local GPU toolchain and avoids PTX mismatch issues on other devices):
+```bash
+./build.sh
+```
+
+Direct nvcc build (may fail on a different GPU with `the provided PTX was compiled with an unsupported toolchain`):
 ```bash
 nvcc -std=c++17 -O3 -Xcompiler -fopenmp -I./src \
   src/main.cu \
