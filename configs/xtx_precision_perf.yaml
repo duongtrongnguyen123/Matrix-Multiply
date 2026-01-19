@@ -7,7 +7,7 @@ experiment:
     double_buffering: true   # true=double buffering, false=single buffering
 
 matrix:
-    M: 1048576
+    M: 2097152
     N: 16384
     dtype_storage: fp32
     layout: row_major
