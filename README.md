@@ -24,7 +24,7 @@ This project focuses on engineering efficient end-to-end matrix multiplication p
 
 ## Build
 
-Recommended (compiles for the local GPU toolchain and avoids PTX mismatch issues on other devices):
+**Recommended** (builds against the local GPU toolchain to avoid PTX compatibility issues across architectures):
 ```bash
 ./build.sh
 ```
