@@ -1,6 +1,6 @@
 # System-Level Optimization of Large-Scale Matrix Multiplication on GPUs
 
-Report (PDF): [out-of-core-gpu-matmul-report.pdf](docs/out-of-core-gpu-matmul-report.pdf)
+Report (PDF): [out-of-core-gpu-matmul-report.pdf](https://duongtrongnguyen123.github.io/gpu-out-of-core-xtx/out-of-core-gpu-matmul-report.pdf)
 
 Matrix multiplication is a core operation in large-scale data analysis and machine learning workloads. When matrix sizes exceed device memory capacity, overall performance is often dominated not by compute throughput but by host-device data movement and memory management.
 
