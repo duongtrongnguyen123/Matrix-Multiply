@@ -1,5 +1,7 @@
 # System-Level Optimization of Large-Scale Matrix Multiplication on GPUs
 
+Report (PDF): [benchmark_report.pdf](https://duongtrongnguyen123.github.io/Matrix-Multiply/benchmark_report.pdf)
+
 Matrix multiplication is a core operation in large-scale data analysis and machine learning workloads. When matrix sizes exceed device memory capacity, overall performance is often dominated not by compute throughput but by host-device data movement and memory management.
 
 This project focuses on engineering efficient end-to-end matrix multiplication pipelines on NVIDIA GPU systems using cuBLAS and cuBLASLt as the compute backend. Rather than implementing custom GPU kernels, the work explores system-level optimizations including:
@@ -80,7 +82,3 @@ See `configs/xtx_precision_perf.yaml` for available options:
 ├── scripts/                 # Evaluation scripts
 └── README.md
 ```
-
-## Report
-
-For detailed methodology, experiments, and results, see the full report: `report.pdf`
